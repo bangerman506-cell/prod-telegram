@@ -7,7 +7,7 @@ app = Flask(__name__)
 def home():
     return "Seedr Bridge Active"
 
-# --- 1. ADD MAGNET (Kodi Method) ---
+# --- 1. ADD MAGNET (Kodi Method - Keep this, it works!) ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -29,28 +29,30 @@ def add_magnet():
     except Exception as e:
         return jsonify({"result": False, "error": str(e)})
 
-# --- 2. LIST FILES (Kodi Method - FIXED) ---
+# --- 2. LIST FILES (GET Method - NEW) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
     token = data.get('token')
-    folder_id = data.get('folder_id', "0") # Default to 0 (Root)
+    folder_id = data.get('folder_id', "0")
     
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # SWITCHING TO KODI ENDPOINT
-    url = "https://www.seedr.cc/oauth_test/resource.php"
+    # API Endpoint
+    url = "https://www.seedr.cc/api/folder"
     
-    payload = {
+    # FOR GET REQUEST: Parameters go in the URL Query, not body
+    params = {
         "access_token": token,
-        "func": "get_folder",
         "folder_id": str(folder_id)
     }
     
     try:
-        print(f"Listing folder {folder_id} via Kodi Method...")
-        resp = requests.post(url, data=payload)
+        print(f"Listing folder {folder_id} using GET...")
+        # Note: We use requests.get here
+        resp = requests.get(url, params=params)
+        
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
