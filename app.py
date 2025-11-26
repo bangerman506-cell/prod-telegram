@@ -3,64 +3,41 @@ import requests
 
 app = Flask(__name__)
 
-# SEEDR ENDPOINTS
-LOGIN_URL = "https://www.seedr.cc/rest/login"
-ADD_MAGNET_URL = "https://www.seedr.cc/rest/transfer/magnet"
-
-# FAKE BROWSER HEADERS (The Magic Fix)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
-    "Origin": "https://www.seedr.cc",
-    "Referer": "https://www.seedr.cc/files"
-}
-
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet_to_seedr():
     data = request.json
-    username = data.get('username')
-    password = data.get('password')
+    token = data.get('token')
     magnet_link = data.get('magnet')
 
-    if not username or not password or not magnet_link:
-        return jsonify({"success": False, "error": "Missing inputs"}), 400
+    if not token or not magnet_link:
+        return jsonify({"success": False, "error": "Missing token or magnet"}), 400
 
-    # Start a Session
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    
-    # Step 1: Login
-    login_data = {
-        'username': username,
-        'password': password,
-        'type': 'login'
+    # 1. Setup headers for the "seedr_xbmc" client (Official Kodi App)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Seedr Kodi/1.0",
+        "Content-Type": "application/x-www-form-urlencoded"
     }
+
+    # 2. Use the Official API Endpoint for Devices
+    url = "https://www.seedr.cc/api/folder/magnet/add"
     
-    print(f"Attempting login for {username}...")
-    login_resp = session.post(LOGIN_URL, data=login_data)
+    # 3. Payload
+    payload = {
+        "torrent_magnet": magnet_link,
+        "folder_id": 0  # 0 means root folder
+    }
+
+    print(f"Adding magnet with token: {token[:5]}...")
     
-    # Check login success
-    try:
-        login_json = login_resp.json()
-    except:
-        return jsonify({"success": False, "error": "Login returned non-JSON", "details": login_resp.text}), 401
-
-    if login_resp.status_code != 200 or login_json.get('result') is not True:
-         return jsonify({
-            "success": False, 
-            "error": "Login Failed", 
-            "details": login_json
-        }), 401
-
-    print("Login Success! Adding magnet...")
-
-    # Step 2: Add Magnet
-    magnet_data = {'magnet': magnet_link}
-    add_resp = session.post(ADD_MAGNET_URL, data=magnet_data)
-
-    return jsonify(add_resp.json())
+    # 4. Send Request
+    response = requests.post(url, data=payload, headers=headers)
+    
+    # 5. Return Result
+    return jsonify({
+        "status_code": response.status_code,
+        "seedr_response": response.json() if response.text else "No content"
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
