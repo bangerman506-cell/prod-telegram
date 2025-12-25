@@ -3,6 +3,12 @@ import requests
 
 app = Flask(__name__)
 
+# --- CONFIGURATION ---
+# We use a standard Browser User-Agent for the API to avoid "Bot" detection
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 @app.route('/')
 def home():
     return "Seedr Bridge Active."
@@ -33,7 +39,7 @@ def get_token():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 1. ADD MAGNET ---
+# --- 1. ADD MAGNET (Kodi Method - Proven to work) ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -55,7 +61,7 @@ def add_magnet():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (Fixed Kodi Method) ---
+# --- 2. LIST FILES (The Brute Force Fix) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -65,31 +71,23 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # We go BACK to the endpoint that works for your token
-    url = "https://www.seedr.cc/oauth_test/resource.php"
+    url = "https://www.seedr.cc/api/folder"
     
-    # We add 'content_type' which is required by some versions of this API
-    payload = {
+    # We send ALL possible parameter names to force it to open the folder
+    params = {
         "access_token": token,
-        "func": "get_folder",
-        "folder_id": str(folder_id),
-        "content_type": "video" 
+        "folder_id": str(folder_id),  # Standard
+        "id": str(folder_id),         # Alternative
+        "folder": str(folder_id)      # Rare variant
     }
     
     try:
-        print(f"Opening folder {folder_id} via Kodi Resource...")
-        resp = requests.post(url, data=payload)
-        
-        # If empty response (server error), try without content_type
-        if not resp.text:
-            print("Retrying without content_type...")
-            del payload['content_type']
-            resp = requests.post(url, data=payload)
-
+        print(f"Brute forcing folder {folder_id}...")
+        # Use GET request with browser headers
+        resp = requests.get(url, params=params, headers=HEADERS)
         return jsonify(resp.json())
     except Exception as e:
-        # Return the raw text if JSON fails, so we can see the error
-        return jsonify({"error": str(e), "raw_response": resp.text if 'resp' in locals() else "No response"}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
