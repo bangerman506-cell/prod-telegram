@@ -33,7 +33,7 @@ def get_token():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 1. ADD MAGNET (Proven Working Method) ---
+# --- 1. ADD MAGNET ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -55,7 +55,7 @@ def add_magnet():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (FIXED: Query Param Method) ---
+# --- 2. LIST FILES (FIXED: FS URL Structure) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -65,23 +65,21 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # We use the Standard API, but pass token in the URL params
-    url = "https://www.seedr.cc/api/folder"
+    # FORCE the Folder ID into the URL
+    url = f"https://www.seedr.cc/fs/folder/{folder_id}/items"
     
-    # This creates: /api/folder?access_token=XYZ&folder_id=123
+    # Authenticate via Query Param
     params = {
-        "access_token": token,
-        "folder_id": str(folder_id)
+        "access_token": token
     }
     
-    # Headers: Act like a Browser/Kodi
+    # Headers
     headers = {
         "User-Agent": "Seedr Kodi/1.0.3"
     }
     
     try:
-        print(f"Listing folder {folder_id} with Query Params...")
-        # Use GET request
+        print(f"Opening folder {folder_id}...")
         resp = requests.get(url, params=params, headers=headers)
         return jsonify(resp.json())
     except Exception as e:
