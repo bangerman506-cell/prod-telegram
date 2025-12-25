@@ -3,18 +3,24 @@ import requests
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-# We act exactly like the Kodi plugin
-HEADERS = {
-    "User-Agent": "Seedr Kodi/1.0.3",
-    "Content-Type": "application/x-www-form-urlencoded"
-}
+# --- AUTH ENDPOINTS (Keep these for generating tokens) ---
+@app.route('/auth/code', methods=['GET'])
+def get_code():
+    # ... (Keep existing logic or simplify)
+    return jsonify({"message": "Use /auth/token with device_code"})
+
+@app.route('/auth/token', methods=['GET'])
+def get_token():
+    # ... (Keep existing logic)
+    return jsonify({"message": "Token generator"})
+
+# --- MAIN BRIDGE ---
 
 @app.route('/')
 def home():
-    return "Seedr Kodi Bridge Active"
+    return "Seedr Bridge Active."
 
-# --- 1. ADD MAGNET ---
+# --- 1. ADD MAGNET (Updated to match your notes) ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -24,21 +30,29 @@ def add_magnet():
     if not token or not magnet:
         return jsonify({"error": "Missing params"}), 400
         
-    url = "https://www.seedr.cc/oauth_test/resource.php"
+    # URL from your notes
+    url = "https://www.seedr.cc/oauth_test/resource.php?json=1"
+    
+    # HEADERS: authorization is Key!
+    headers = {
+        "User-Agent": "Seedr Kodi/1.0.3",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    
+    # BODY: action=add_magnet
     payload = {
-        "access_token": token,
-        "func": "add_torrent",
-        "torrent_magnet": magnet
+        "action": "add_magnet",
+        "magnet": magnet
     }
     
     try:
-        # Uses Kodi Endpoint
-        resp = requests.post(url, data=payload, headers=HEADERS)
+        resp = requests.post(url, data=payload, headers=headers)
         return jsonify(resp.json())
     except Exception as e:
-        return jsonify({"result": False, "error": str(e)})
+        return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (Corrected) ---
+# --- 2. LIST FILES (Updated to match your notes) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -48,18 +62,18 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # STRATEGY: Use Standard API but with KODI HEADERS
-    # This tricks Seedr into thinking the Kodi app is asking for the file list
-    url = "https://www.seedr.cc/api/folder"
+    # URL from your notes: /fs/folder/{id}/items
+    url = f"https://www.seedr.cc/fs/folder/{folder_id}/items"
     
-    payload = {
-        "access_token": token,
-        "folder_id": str(folder_id)
+    # HEADERS: This is the magic part
+    headers = {
+        "User-Agent": "Seedr Kodi/1.0.3",
+        "Authorization": f"Bearer {token}"
     }
     
     try:
-        print(f"Listing folder {folder_id} as Kodi...")
-        resp = requests.post(url, data=payload, headers=HEADERS)
+        print(f"Listing folder {folder_id} with Bearer Header...")
+        resp = requests.get(url, headers=headers)
         
         return jsonify(resp.json())
     except Exception as e:
