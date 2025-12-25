@@ -3,18 +3,11 @@ import requests
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-# Headers for Listing Files (Official API style)
-API_HEADERS = {
-    "User-Agent": "Seedr Kodi/1.0.3",
-    "Content-Type": "application/x-www-form-urlencoded"
-}
-
 @app.route('/')
 def home():
     return "Seedr Bridge Active."
 
-# --- AUTH ENDPOINTS (Keep these) ---
+# --- AUTH ENDPOINTS ---
 @app.route('/auth/code', methods=['GET'])
 def get_code():
     url = "https://www.seedr.cc/oauth_device/create"
@@ -40,8 +33,7 @@ def get_token():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 1. ADD MAGNET (REVERTED TO KODI METHOD) ---
-# This matches the setup that gave us the "Victory" earlier.
+# --- 1. ADD MAGNET (Proven Working Method) ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -51,25 +43,19 @@ def add_magnet():
     if not token or not magnet:
         return jsonify({"error": "Missing params"}), 400
         
-    # The "Kodi" Endpoint (Proven to work for adding)
     url = "https://www.seedr.cc/oauth_test/resource.php"
-    
-    # Token goes in BODY, not Header
     payload = {
         "access_token": token,
         "func": "add_torrent",
         "torrent_magnet": magnet
     }
-    
     try:
-        # No special headers needed here, just the payload
         resp = requests.post(url, data=payload)
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (NEW API METHOD) ---
-# This uses the endpoint from your notes which works for listing.
+# --- 2. LIST FILES (FIXED: Query Param Method) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -79,17 +65,24 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # The FS Endpoint (Best for listing)
-    url = f"https://www.seedr.cc/fs/folder/{folder_id}/items"
+    # We use the Standard API, but pass token in the URL params
+    url = "https://www.seedr.cc/api/folder"
     
-    # Token goes in HEADER here (Bearer style)
+    # This creates: /api/folder?access_token=XYZ&folder_id=123
+    params = {
+        "access_token": token,
+        "folder_id": str(folder_id)
+    }
+    
+    # Headers: Act like a Browser/Kodi
     headers = {
-        "Authorization": f"Bearer {token}"
+        "User-Agent": "Seedr Kodi/1.0.3"
     }
     
     try:
-        # Use GET for listing
-        resp = requests.get(url, headers=headers)
+        print(f"Listing folder {folder_id} with Query Params...")
+        # Use GET request
+        resp = requests.get(url, params=params, headers=headers)
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
