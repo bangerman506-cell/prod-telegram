@@ -2,6 +2,7 @@ import os
 import threading
 import asyncio
 import requests
+import time
 from flask import Flask, request, jsonify
 from pyrogram import Client
 
@@ -12,67 +13,61 @@ API_ID = os.environ.get("TG_API_ID")
 API_HASH = os.environ.get("TG_API_HASH")
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 
-# Safety conversion
+# Ensure API_ID is an integer
 if API_ID:
     try:
         API_ID = int(API_ID)
     except:
-        pass
+        print("Error: API_ID must be an integer")
 
 HEADERS = {
     "User-Agent": "Seedr Android/1.0",
     "Content-Type": "application/x-www-form-urlencoded"
 }
 
-# --- HELPER: STREAM CLASS (FIXED) ---
-class HTTPStream:
-    def __init__(self, url, filename):
-        self.url = url
-        self.name = filename
-        self.mode = 'rb'  # <--- THIS IS THE FIX. Tells Pyrogram "I am a Binary File"
-        
-        print(f"STREAM: Connecting to Seedr...")
-        self.response = requests.get(url, stream=True)
-        if self.response.status_code != 200:
-            print(f"STREAM ERROR: {self.response.status_code}")
-            raise ValueError(f"Seedr connection failed")
-            
-        self.raw = self.response.raw
-        self.raw.decode_content = True
-
-    def read(self, chunk_size=-1):
-        if chunk_size == -1:
-            return self.raw.read()
-        return self.raw.read(chunk_size)
-
-# --- WORKER ---
+# --- WORKER: UPLOAD ENGINE ---
 def upload_worker(file_url, chat_id, caption):
     print(f"WORKER: Starting upload to {chat_id}")
     
+    # Create a new event loop for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     async def perform_upload():
         async with Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True) as app:
             print("WORKER: Bot connected!")
+            
             try:
-                # Create the stream wrapper
-                stream = HTTPStream(file_url, "video.mp4")
+                # 1. Connect to Seedr Stream
+                print("WORKER: Connecting to file stream...")
+                # We use stream=True to not download it to memory
+                response = requests.get(file_url, stream=True, timeout=30)
                 
-                print("WORKER: Sending video...")
+                # 2. THE FIX: Monkey Patch the Raw Object
+                # Instead of a custom class, we use the raw socket and label it
+                stream = response.raw
+                stream.name = "video.mp4" # Pyrogram needs a filename
+                stream.mode = "rb"        # Pyrogram needs to know it's binary
+                stream.decode_content = True 
+
+                print("WORKER: Stream Ready. Sending to Telegram...")
+                
+                # 3. Upload
                 await app.send_video(
                     chat_id=int(chat_id),
                     video=stream,
                     caption=caption,
                     supports_streaming=True,
-                    progress=lambda c, t: print(f"Progress: {c/1024/1024:.1f} MB") if c % (10*1024*1024) == 0 else None
+                    progress=lambda current, total: print(f"Progress: {current/1024/1024:.2f} MB") if current % (5*1024*1024) == 0 else None
                 )
-                print("WORKER: Upload success!")
+                print("WORKER: Upload Success!")
+                
             except Exception as e:
                 print(f"WORKER ERROR: {e}")
                 import traceback
                 traceback.print_exc()
 
+    # Run the async loop
     try:
         loop.run_until_complete(perform_upload())
     except Exception as e:
@@ -96,11 +91,13 @@ def upload_telegram():
     if not file_url or not chat_id:
         return jsonify({"error": "Missing params"}), 400
 
+    # Start background process
     thread = threading.Thread(target=upload_worker, args=(file_url, chat_id, caption))
     thread.start()
+    
     return jsonify({"status": "Upload started"})
 
-# --- SEEDR ROUTES (KEEPING ALL PREVIOUS FUNCTIONS) ---
+# --- EXISTING SEEDR ROUTES (UNCHANGED) ---
 
 @app.route('/auth/code', methods=['GET'])
 def get_code():
@@ -125,13 +122,23 @@ def add_magnet():
 
 @app.route('/list-files', methods=['POST'])
 def list_files():
+    # Force Folder ID strategy
     data = request.json
     token = data.get('token')
     folder_id = data.get('folder_id', "0")
-    if str(folder_id) == "0": url = "https://www.seedr.cc/api/folder"
-    else: url = f"https://www.seedr.cc/api/folder/{folder_id}"
+    
+    # We use the brute force listing method that worked for you
+    url = "https://www.seedr.cc/api/folder"
+    params = {
+        "access_token": token,
+        "folder_id": str(folder_id),
+        "id": str(folder_id),
+        "folder": str(folder_id)
+    }
     try:
-        resp = requests.get(url, params={"access_token": token}, headers=HEADERS)
+        # User-Agent header is critical for listing
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        resp = requests.get(url, params=params, headers=headers)
         return jsonify(resp.json())
     except Exception as e: return jsonify({"error": str(e)}), 500
 
