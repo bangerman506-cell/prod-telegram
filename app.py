@@ -2,7 +2,6 @@ import os
 import threading
 import asyncio
 import requests
-import io
 from flask import Flask, request, jsonify
 from pyrogram import Client
 
@@ -13,32 +12,43 @@ API_ID = os.environ.get("TG_API_ID")
 API_HASH = os.environ.get("TG_API_HASH")
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 
+# Ensure API_ID is integer
 if API_ID:
     try:
         API_ID = int(API_ID)
     except:
         pass
 
-# --- 1. THE FIXED STREAMER ---
-class CustomStream:
+# --- 1. THE SMART STREAMER (FIXED) ---
+# We do NOT inherit from io.BytesIO anymore. This prevents the "Invalid File" error.
+class SmartStream:
     def __init__(self, url, name):
         self.url = url
         self.name = name
-        self.mode = 'rb'  # <--- THIS IS THE FIX (Binary Mode)
+        self.mode = 'rb' # Critical: Tells Pyrogram this is binary
         
         print(f"STREAM: Connecting to {url[:30]}...")
         
-        # Start the stream
+        # 1. Get File Size (HEAD)
+        try:
+            head = requests.head(url, allow_redirects=True)
+            self.total_size = int(head.headers.get('content-length', 0))
+            print(f"STREAM: Size is {self.total_size} bytes")
+        except:
+            self.total_size = 0
+
+        # 2. Start the real Stream
         self.response = requests.get(url, stream=True)
         self.raw = self.response.raw
-        
-        # Get total size for the progress bar
-        self.total_size = int(self.response.headers.get('content-length', 0))
-        print(f"STREAM: File size is {self.total_size} bytes")
-        
         self.current_pos = 0
 
-    # Pyrogram calls this to check size
+    # Pyrogram calls this to read data
+    def read(self, size=-1):
+        if size == -1:
+            return self.raw.read()
+        return self.raw.read(size)
+
+    # Pyrogram calls this to check size (Virtual Seek)
     def seek(self, offset, whence=0):
         if whence == 0:
             self.current_pos = offset
@@ -47,10 +57,6 @@ class CustomStream:
         elif whence == 2:
             self.current_pos = self.total_size + offset
         return self.current_pos
-
-    # Pyrogram calls this to read data
-    def read(self, size=-1):
-        return self.raw.read(size)
     
     # Pyrogram calls this to see where we are
     def tell(self):
@@ -59,6 +65,8 @@ class CustomStream:
 # --- 2. UPLOAD WORKER ---
 def upload_worker(file_url, chat_id, caption):
     print(f"WORKER: Starting upload to {chat_id}")
+    
+    # Create isolated event loop for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -66,13 +74,13 @@ def upload_worker(file_url, chat_id, caption):
         async with Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True) as app:
             print("WORKER: Bot connected!")
             try:
-                # Use the Fixed Stream
-                stream = CustomStream(file_url, "video.mp4")
+                # Use Smart Streamer
+                stream = SmartStream(file_url, "video.mp4")
                 
+                # Double check stream health
                 if stream.total_size == 0:
-                    print("WORKER ERROR: File size is 0. Check Seedr link.")
-                    return
-
+                    print("WORKER WARNING: Could not determine file size, upload might fail.")
+                
                 print("WORKER: Streaming to Telegram...")
                 await app.send_video(
                     chat_id=int(chat_id),
@@ -100,6 +108,7 @@ def upload_worker(file_url, chat_id, caption):
 def home():
     return "Seedr-Telegram Bridge Active."
 
+# --- TELEGRAM UPLOAD ROUTE ---
 @app.route('/upload-telegram', methods=['POST'])
 def upload_telegram():
     data = request.json
@@ -110,8 +119,10 @@ def upload_telegram():
     if not file_url or not chat_id:
         return jsonify({"error": "Missing params"}), 400
 
+    # Start background process
     thread = threading.Thread(target=upload_worker, args=(file_url, chat_id, caption))
     thread.start()
+    
     return jsonify({"status": "Upload started"})
 
 # ==========================================
