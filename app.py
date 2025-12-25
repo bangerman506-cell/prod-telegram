@@ -3,11 +3,18 @@ import requests
 
 app = Flask(__name__)
 
+# --- CONFIGURATION ---
+# We act exactly like the Kodi plugin
+HEADERS = {
+    "User-Agent": "Seedr Kodi/1.0.3",
+    "Content-Type": "application/x-www-form-urlencoded"
+}
+
 @app.route('/')
 def home():
-    return "Seedr Bridge Active"
+    return "Seedr Kodi Bridge Active"
 
-# --- 1. ADD MAGNET (Kodi Method - Keep this, it works!) ---
+# --- 1. ADD MAGNET ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -23,13 +30,15 @@ def add_magnet():
         "func": "add_torrent",
         "torrent_magnet": magnet
     }
+    
     try:
-        resp = requests.post(url, data=payload)
+        # Uses Kodi Endpoint
+        resp = requests.post(url, data=payload, headers=HEADERS)
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"result": False, "error": str(e)})
 
-# --- 2. LIST FILES (GET Method - NEW) ---
+# --- 2. LIST FILES (Corrected) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -39,19 +48,18 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # API Endpoint
+    # STRATEGY: Use Standard API but with KODI HEADERS
+    # This tricks Seedr into thinking the Kodi app is asking for the file list
     url = "https://www.seedr.cc/api/folder"
     
-    # FOR GET REQUEST: Parameters go in the URL Query, not body
-    params = {
+    payload = {
         "access_token": token,
         "folder_id": str(folder_id)
     }
     
     try:
-        print(f"Listing folder {folder_id} using GET...")
-        # Note: We use requests.get here
-        resp = requests.get(url, params=params)
+        print(f"Listing folder {folder_id} as Kodi...")
+        resp = requests.post(url, data=payload, headers=HEADERS)
         
         return jsonify(resp.json())
     except Exception as e:
