@@ -3,12 +3,6 @@ import requests
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-HEADERS = {
-    "User-Agent": "Seedr Kodi/1.0.3",
-    "Content-Type": "application/x-www-form-urlencoded"
-}
-
 @app.route('/')
 def home():
     return "Seedr Bridge Active."
@@ -39,7 +33,7 @@ def get_token():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 1. ADD MAGNET (Kodi Method - Proven Working) ---
+# --- 1. ADD MAGNET ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -61,7 +55,7 @@ def add_magnet():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (Direct API Method - Fixed) ---
+# --- 2. LIST FILES (Fixed Kodi Method) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -71,21 +65,31 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # Switching to the /api/folder endpoint
-    # This endpoint listens to POST body parameters correctly
-    url = "https://www.seedr.cc/api/folder"
+    # We go BACK to the endpoint that works for your token
+    url = "https://www.seedr.cc/oauth_test/resource.php"
     
+    # We add 'content_type' which is required by some versions of this API
     payload = {
         "access_token": token,
-        "folder_id": folder_id  # Sending as is (int or string)
+        "func": "get_folder",
+        "folder_id": str(folder_id),
+        "content_type": "video" 
     }
     
     try:
-        print(f"Listing folder {folder_id} via API...")
+        print(f"Opening folder {folder_id} via Kodi Resource...")
         resp = requests.post(url, data=payload)
+        
+        # If empty response (server error), try without content_type
+        if not resp.text:
+            print("Retrying without content_type...")
+            del payload['content_type']
+            resp = requests.post(url, data=payload)
+
         return jsonify(resp.json())
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Return the raw text if JSON fails, so we can see the error
+        return jsonify({"error": str(e), "raw_response": resp.text if 'resp' in locals() else "No response"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
