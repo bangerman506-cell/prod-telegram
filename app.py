@@ -3,6 +3,10 @@ import requests
 
 app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return "Seedr Bridge Active."
+
 # --- AUTH ENDPOINTS ---
 @app.route('/auth/code', methods=['GET'])
 def get_code():
@@ -29,7 +33,7 @@ def get_token():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 1. ADD MAGNET (Keep this, it works) ---
+# --- 1. ADD MAGNET (Working) ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -39,7 +43,8 @@ def add_magnet():
     if not token or not magnet:
         return jsonify({"error": "Missing params"}), 400
         
-    url = "https://www.seedr.cc/oauth_test/resource.php"
+    # We add ?json=1 to be safe here too
+    url = "https://www.seedr.cc/oauth_test/resource.php?json=1"
     payload = {
         "access_token": token,
         "func": "add_torrent",
@@ -51,7 +56,7 @@ def add_magnet():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (Double-Tap Method) ---
+# --- 2. LIST FILES (Kodi Method with JSON Fix) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -61,38 +66,28 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # The Endpoint from your notes
-    url = f"https://www.seedr.cc/fs/folder/{folder_id}/items"
+    # CRITICAL FIX: ?json=1 tells Seedr to send JSON, not XML/Text
+    url = "https://www.seedr.cc/oauth_test/resource.php?json=1"
     
-    print(f"--- Attempting to open folder {folder_id} ---")
-
-    # ATTEMPT 1: Bearer Token in Header (Standard)
-    headers = {
-        "User-Agent": "Seedr Kodi/1.0.3",
-        "Authorization": f"Bearer {token}"
+    payload = {
+        "access_token": token,
+        "func": "get_folder",
+        "folder_id": str(folder_id)
     }
+    
     try:
-        print("Trying Bearer Header...")
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
+        print(f"Kodi Method: Opening folder {folder_id}...")
+        resp = requests.post(url, data=payload)
+        
+        # Check raw response if it fails
+        if not resp.text:
+            return jsonify({"error": "Empty response from Seedr"}), 500
+
+        try:
             return jsonify(resp.json())
-        print(f"Bearer failed with {resp.status_code}")
-    except:
-        pass
-
-    # ATTEMPT 2: Token in Query Param (Alternative)
-    # Some device tokens ONLY work this way
-    params = {
-        "access_token": token
-    }
-    # Clear authorization header for this attempt so it doesn't conflict
-    headers_simple = {
-        "User-Agent": "Seedr Kodi/1.0.3"
-    }
-    try:
-        print("Trying Query Param...")
-        resp = requests.get(url, params=params, headers=headers_simple)
-        return jsonify(resp.json())
+        except:
+            return jsonify({"error": "Invalid JSON", "raw": resp.text}), 500
+            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
