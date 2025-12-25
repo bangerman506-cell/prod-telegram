@@ -1,25 +1,24 @@
+import os
 import threading
-import time
+import asyncio
 import requests
 from flask import Flask, request, jsonify
 from pyrogram import Client
 
 app = Flask(__name__)
 
-# --- TELEGRAM CONFIGURATION ---
-API_ID = 29211789
-API_HASH = "0500d6ebe45d42efe9ff73bf47cb3b4b"
-BOT_TOKEN = "8319241228:AAHQotAqCjvOejaOVWtFUnLbxDAZilQotwA"
+# --- CONFIGURATION (SECURE) ---
+# We read these from Render's Environment Variables
+API_ID = os.environ.get("TG_API_ID")
+API_HASH = os.environ.get("TG_API_HASH")
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 
-# --- SEEDR CONFIGURATION ---
 HEADERS = {
     "User-Agent": "Seedr Android/1.0",
     "Content-Type": "application/x-www-form-urlencoded"
 }
 
 # --- HELPER: STREAM CLASS ---
-# This tricks Pyrogram into thinking it's reading a local file,
-# but actually it's streaming directly from the internet.
 class HTTPStream:
     def __init__(self, url, filename):
         self.url = url
@@ -30,32 +29,35 @@ class HTTPStream:
     def read(self, chunk_size):
         return self.raw.read(chunk_size)
 
-# --- WORKER: BACKGROUND UPLOAD ---
+# --- WORKER: BACKGROUND UPLOAD (FIXED ASYNC LOOP) ---
 def upload_worker(file_url, chat_id, caption):
     print(f"Starting upload to {chat_id}...")
     
-    # Initialize Bot
-    bot = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
-    
+    # 1. Create a new Event Loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 2. Define the async upload task
+    async def perform_upload():
+        async with Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True) as app:
+            print("Bot connected!")
+            stream = HTTPStream(file_url, "video.mp4")
+            
+            await app.send_video(
+                chat_id=int(chat_id),
+                video=stream,
+                caption=caption,
+                supports_streaming=True
+            )
+            print("Upload completed successfully!")
+
+    # 3. Run the loop
     try:
-        bot.start()
-        
-        # Create the stream
-        stream = HTTPStream(file_url, "video.mp4")
-        
-        # Send video (supports files up to 2GB via Bot API, 4GB via MTProto)
-        bot.send_video(
-            chat_id=int(chat_id),
-            video=stream,
-            caption=caption,
-            supports_streaming=True
-        )
-        print("Upload success!")
-        
+        loop.run_until_complete(perform_upload())
     except Exception as e:
         print(f"Upload failed: {e}")
     finally:
-        bot.stop()
+        loop.close()
 
 # --- ROUTES ---
 
@@ -73,13 +75,13 @@ def upload_telegram():
     if not file_url or not chat_id:
         return jsonify({"error": "Missing url or chat_id"}), 400
 
-    # Run upload in background so n8n doesn't timeout
+    # Start background thread
     thread = threading.Thread(target=upload_worker, args=(file_url, chat_id, caption))
     thread.start()
     
     return jsonify({"status": "Upload started", "message": "Check your Telegram channel in a few minutes."})
 
-# --- EXISTING SEEDR ROUTES (Keep these exactly as they were) ---
+# --- SEEDR ROUTES (UNCHANGED) ---
 
 @app.route('/auth/code', methods=['GET'])
 def get_code():
