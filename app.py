@@ -3,6 +3,12 @@ import requests
 
 app = Flask(__name__)
 
+# --- CONFIGURATION ---
+HEADERS = {
+    "User-Agent": "Seedr Kodi/1.0.3",
+    "Content-Type": "application/x-www-form-urlencoded"
+}
+
 @app.route('/')
 def home():
     return "Seedr Bridge Active."
@@ -33,7 +39,7 @@ def get_token():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 1. ADD MAGNET ---
+# --- 1. ADD MAGNET (Kodi Method - Proven Working) ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     data = request.json
@@ -55,7 +61,7 @@ def add_magnet():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# --- 2. LIST FILES (FIXED: FS URL Structure) ---
+# --- 2. LIST FILES (Direct API Method - Fixed) ---
 @app.route('/list-files', methods=['POST'])
 def list_files():
     data = request.json
@@ -65,22 +71,18 @@ def list_files():
     if not token:
         return jsonify({"error": "Missing token"}), 400
 
-    # FORCE the Folder ID into the URL
-    url = f"https://www.seedr.cc/fs/folder/{folder_id}/items"
+    # Switching to the /api/folder endpoint
+    # This endpoint listens to POST body parameters correctly
+    url = "https://www.seedr.cc/api/folder"
     
-    # Authenticate via Query Param
-    params = {
-        "access_token": token
-    }
-    
-    # Headers
-    headers = {
-        "User-Agent": "Seedr Kodi/1.0.3"
+    payload = {
+        "access_token": token,
+        "folder_id": folder_id  # Sending as is (int or string)
     }
     
     try:
-        print(f"Opening folder {folder_id}...")
-        resp = requests.get(url, params=params, headers=headers)
+        print(f"Listing folder {folder_id} via API...")
+        resp = requests.post(url, data=payload)
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
