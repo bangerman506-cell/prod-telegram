@@ -79,12 +79,13 @@ class SmartStream(IOBase):
     def fileno(self): 
         return None
 
-# --- 2. ASYNC UPLOAD LOGIC (STRATEGY B: NUMERIC ID) ---
+# --- 2. ASYNC UPLOAD LOGIC (SMART STRATEGY WITH INVITE LINK SUPPORT) ---
 async def perform_upload(file_url, chat_target, caption, filename):
     """
-    STRATEGY B: Direct Numeric ID
-    - Public channels: Use @username OR numeric ID
-    - Private channels: Use numeric ID only (bot must be admin)
+    Smart Upload Strategy:
+    - Invite links (https://t.me/+...) for private channels → Forces access refresh
+    - Usernames (@channel) for public channels → Always resolvable
+    - Numeric IDs as fallback → Uses message fetch to refresh access
     """
     async with Client(
         "bot_session", 
@@ -98,9 +99,55 @@ async def perform_upload(file_url, chat_target, caption, filename):
         final_chat_id = None
         chat_str = str(chat_target).strip()
         
-        # --- STRATEGY 1: PUBLIC USERNAME (@channel) ---
-        if chat_str.startswith("@"):
-            print(f"WORKER: Public username: {chat_str}", flush=True)
+        # --- STRATEGY 1: INVITE LINK (PRIVATE CHANNELS) ---
+        if "t.me/+" in chat_str or "joinchat" in chat_str:
+            print(f"WORKER: 🔗 Invite link detected", flush=True)
+            try:
+                # Extract hash from link
+                if "t.me/+" in chat_str:
+                    invite_hash = chat_str.split("t.me/+")[1].split("?")[0].split("/")[0]
+                elif "joinchat/" in chat_str:
+                    invite_hash = chat_str.split("joinchat/")[1].split("?")[0].split("/")[0]
+                
+                print(f"WORKER: Extracted hash: {invite_hash[:10]}...", flush=True)
+                
+                # Use join_chat to refresh access (even if already member)
+                try:
+                    chat = await app.join_chat(chat_str)
+                    final_chat_id = chat.id
+                    print(f"WORKER: ✅ Joined/Refreshed → ID: {final_chat_id}", flush=True)
+                    
+                except UserAlreadyParticipant:
+                    # Already in channel, fetch via message history
+                    print("WORKER: Already in channel, fetching ID via messages...", flush=True)
+                    try:
+                        async for msg in app.get_chat_history(chat_str, limit=1):
+                            final_chat_id = msg.chat.id
+                            print(f"WORKER: ✅ Got ID from message: {final_chat_id}", flush=True)
+                            break
+                    except Exception as e2:
+                        print(f"WORKER WARNING: Message fetch failed: {e2}", flush=True)
+                        # Last resort: try get_chat
+                        try:
+                            chat = await app.get_chat(chat_str)
+                            final_chat_id = chat.id
+                            print(f"WORKER: ✅ Got ID from get_chat: {final_chat_id}", flush=True)
+                        except Exception as e3:
+                            raise Exception(f"Cannot resolve invite link: {e3}")
+                
+                except FloodWait as e:
+                    print(f"WORKER: ⏳ FloodWait {e.value}s, waiting...", flush=True)
+                    await asyncio.sleep(e.value)
+                    chat = await app.join_chat(chat_str)
+                    final_chat_id = chat.id
+                    
+                except Exception as e:
+                    print(f"WORKER ERROR: Invite link failed: {e}", flush=True)
+                    raise Exception(f"Cannot access channel via invite link: {e}")
+        
+        # --- STRATEGY 2: PUBLIC USERNAME ---
+        elif chat_str.startswith("@"):
+            print(f"WORKER: 👤 Public username: {chat_str}", flush=True)
             try:
                 chat = await app.get_chat(chat_str)
                 final_chat_id = chat.id
@@ -108,33 +155,30 @@ async def perform_upload(file_url, chat_target, caption, filename):
             except Exception as e:
                 raise Exception(f"Username resolution failed: {e}")
         
-        # --- STRATEGY 2: NUMERIC ID (PRIVATE CHANNELS) ---
+        # --- STRATEGY 3: NUMERIC ID (FALLBACK WITH REFRESH) ---
         elif chat_str.lstrip("-").isdigit():
             final_chat_id = int(chat_str)
-            print(f"WORKER: Using numeric ID: {final_chat_id}", flush=True)
+            print(f"WORKER: 🔢 Using numeric ID: {final_chat_id}", flush=True)
             
-            # Try to verify (non-critical)
+            # Try to refresh access hash via message fetch
             try:
-                chat_info = await app.get_chat(final_chat_id)
-                print(f"WORKER: ✅ Verified: {chat_info.title}", flush=True)
-            except ChannelPrivate:
-                print(f"WORKER: ⚠️ Private channel (will try upload anyway)", flush=True)
+                print("WORKER: Refreshing access hash via message fetch...", flush=True)
+                async for msg in app.get_chat_history(final_chat_id, limit=1):
+                    print(f"WORKER: ✅ Access refreshed via message {msg.id}", flush=True)
+                    break
             except Exception as e:
-                print(f"WORKER: ⚠️ Cannot verify: {e} (continuing...)", flush=True)
+                print(f"WORKER: ⚠️ Could not refresh via messages: {e}", flush=True)
+                # Try get_chat as fallback
+                try:
+                    chat_info = await app.get_chat(final_chat_id)
+                    print(f"WORKER: ✅ Verified via get_chat: {chat_info.title}", flush=True)
+                except Exception as e2:
+                    print(f"WORKER: ⚠️ Verification failed: {e2} (will try upload anyway)", flush=True)
         
-        # --- STRATEGY 3: REJECT INVITE LINKS ---
-        elif "t.me/+" in chat_str or "joinchat" in chat_str:
-            raise Exception(
-                "❌ BOTS CANNOT JOIN PRIVATE CHANNELS VIA INVITE LINKS.\n"
-                "Please use the numeric chat ID instead.\n"
-                "To get it: Visit https://your-render-url.onrender.com/get-id"
-            )
-        
-        # --- UNKNOWN FORMAT ---
         else:
             raise Exception(
                 f"Invalid format: {chat_str}\n"
-                "Use: @username (public) OR -1001234567890 (private)"
+                "Use: https://t.me/+... (private) OR @username (public) OR -100... (numeric)"
             )
         
         if not final_chat_id:
@@ -145,7 +189,7 @@ async def perform_upload(file_url, chat_target, caption, filename):
             if stream.total_size == 0:
                 raise Exception("File size is 0. Seedr link expired.")
             
-            print(f"WORKER: Uploading {filename} to {final_chat_id}...", flush=True)
+            print(f"WORKER: 📤 Uploading {filename} ({stream.total_size/1024/1024:.1f}MB) to {final_chat_id}...", flush=True)
             
             try:
                 msg = await app.send_video(
@@ -155,32 +199,38 @@ async def perform_upload(file_url, chat_target, caption, filename):
                     file_name=filename,
                     supports_streaming=True,
                     progress=lambda c, t: print(
-                        f"📊 {c/1024/1024:.1f}/{t/1024/1024:.1f}MB ({c*100//t}%)", 
+                        f"📊 Progress: {c/1024/1024:.1f}/{t/1024/1024:.1f}MB ({c*100//t}%)", 
                         flush=True
                     ) if c % (50*1024*1024) < 1024*1024 else None
                 )
                 
+                # Generate private message link
                 clean_id = str(msg.chat.id).replace('-100', '')
-                msg_link = f"https://t.me/c/{clean_id}/{msg.id}"
+                private_link = f"https://t.me/c/{clean_id}/{msg.id}"
                 
-                print(f"WORKER: ✅ Upload complete! {msg_link}", flush=True)
+                print(f"WORKER: ✅ Upload complete! Link: {private_link}", flush=True)
                 
                 return {
                     "success": True,
                     "message_id": msg.id,
                     "chat_id": msg.chat.id,
                     "file_id": msg.video.file_id,
-                    "link": msg_link
+                    "file_unique_id": msg.video.file_unique_id,
+                    "private_link": private_link,
+                    "file_size": msg.video.file_size,
+                    "duration": msg.video.duration,
+                    "width": msg.video.width,
+                    "height": msg.video.height
                 }
                 
             except ChatAdminRequired:
                 raise Exception("Bot is not an admin in this channel. Please promote the bot.")
             except ChannelPrivate:
-                raise Exception("Bot has no access to this private channel. Add it as admin first.")
+                raise Exception("Bot has no access to this private channel. Add it as admin or use invite link.")
             except FloodWait as e:
-                raise Exception(f"Telegram rate limit. Wait {e.value}s.")
+                raise Exception(f"Telegram rate limit. Wait {e.value} seconds and try again.")
             except Exception as e:
-                raise Exception(f"Upload failed: {e}")
+                raise Exception(f"Upload failed: {str(e)}")
 
 # --- 3. QUEUE WORKER ---
 JOB_QUEUE = queue.Queue()
@@ -190,7 +240,7 @@ WORKER_LOCK = threading.Lock()
 
 def worker_loop():
     """Background worker that processes upload queue"""
-    print("SYSTEM: Queue Worker Started", flush=True)
+    print("SYSTEM: 🚀 Queue Worker Started", flush=True)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
@@ -198,7 +248,7 @@ def worker_loop():
         job_id = None
         try:
             job_id, data = JOB_QUEUE.get()
-            print(f"WORKER: Job {job_id}", flush=True)
+            print(f"SYSTEM: 📋 Processing Job {job_id}", flush=True)
             JOBS[job_id]['status'] = 'processing'
             JOBS[job_id]['started'] = time.time()
             
@@ -212,30 +262,32 @@ def worker_loop():
             JOBS[job_id]['status'] = 'done'
             JOBS[job_id]['result'] = result
             JOBS[job_id]['completed'] = time.time()
-            print(f"WORKER: ✅ Job {job_id} done!", flush=True)
+            print(f"SYSTEM: ✅ Job {job_id} completed successfully!", flush=True)
             
         except Exception as e:
-            print(f"WORKER ERROR: {e}", flush=True)
+            error_msg = str(e)
+            print(f"SYSTEM: ❌ Job {job_id} failed: {error_msg}", flush=True)
             if job_id:
                 JOBS[job_id]['status'] = 'failed'
-                JOBS[job_id]['error'] = str(e)
+                JOBS[job_id]['error'] = error_msg
                 JOBS[job_id]['failed'] = time.time()
         finally:
             if job_id:
                 JOB_QUEUE.task_done()
             
-            # Cleanup (keep last 100 jobs)
+            # Cleanup old jobs (keep last 100)
             if len(JOBS) > 100:
                 old_jobs = sorted(JOBS.items(), key=lambda x: x[1].get('created', 0))[:50]
                 for old_id, _ in old_jobs:
                     del JOBS[old_id]
+                print("SYSTEM: 🧹 Cleaned up old jobs", flush=True)
 
 def ensure_worker_alive():
     """Start worker thread if not running (thread-safe)"""
     global WORKER_THREAD
     with WORKER_LOCK:
         if WORKER_THREAD is None or not WORKER_THREAD.is_alive():
-            print("SYSTEM: Starting worker thread...", flush=True)
+            print("SYSTEM: 🔄 Starting worker thread...", flush=True)
             WORKER_THREAD = threading.Thread(target=worker_loop, daemon=True)
             WORKER_THREAD.start()
 
@@ -246,8 +298,8 @@ def home():
     ensure_worker_alive()
     return jsonify({
         "status": "online",
-        "queue": JOB_QUEUE.qsize(),
-        "jobs": len(JOBS),
+        "queue_size": JOB_QUEUE.qsize(),
+        "total_jobs": len(JOBS),
         "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False
     })
 
@@ -258,7 +310,7 @@ def upload_telegram():
     POST Body:
     {
         "url": "https://seedr.cc/...",
-        "chat_id": "-1003558592981" OR "@moviessquares",
+        "chat_id": "https://t.me/+InviteHash" OR "@moviessquares" OR "-1003558592981",
         "caption": "Movie Title (1080p)",
         "filename": "movie.mp4"
     }
@@ -275,20 +327,28 @@ def upload_telegram():
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
         'status': 'queued',
-        'created': time.time()
+        'created': time.time(),
+        'request': {
+            'chat_id': data.get('chat_id'),
+            'filename': data.get('filename', 'video.mp4')
+        }
     }
     JOB_QUEUE.put((job_id, data))
     
-    print(f"API: Job {job_id} queued", flush=True)
+    print(f"API: 📥 Job {job_id} queued for chat {data.get('chat_id')}", flush=True)
     
     return jsonify({
         "job_id": job_id,
-        "status": "queued"
+        "status": "queued",
+        "message": "Upload job queued successfully"
     })
 
 @app.route('/job-status/<job_id>', methods=['GET'])
 def job_status(job_id):
-    """Check job status"""
+    """
+    Check job status
+    GET /job-status/{job_id}
+    """
     ensure_worker_alive()
     
     job = JOBS.get(job_id)
@@ -297,10 +357,10 @@ def job_status(job_id):
     
     return jsonify(job)
 
-# --- WEB PAGE TO GET CHAT ID ---
+# --- WEB PAGE TO GET CHAT ID (PUBLIC CHANNELS) ---
 @app.route('/get-id')
 def get_id_page():
-    """Web page to get channel ID without CLI"""
+    """Web page to get channel ID (for public channels only)"""
     return '''
 <!DOCTYPE html>
 <html>
@@ -309,17 +369,22 @@ def get_id_page():
     <style>
         body { font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }
         h1 { color: #0088cc; }
-        input { width: 100%; padding: 10px; margin: 10px 0; font-size: 16px; }
-        button { background: #0088cc; color: white; padding: 10px 20px; border: none; cursor: pointer; font-size: 16px; }
+        input { width: 100%; padding: 10px; margin: 10px 0; font-size: 16px; box-sizing: border-box; }
+        button { background: #0088cc; color: white; padding: 10px 20px; border: none; cursor: pointer; font-size: 16px; border-radius: 5px; }
         button:hover { background: #006699; }
         #result { margin-top: 20px; padding: 15px; background: #f0f0f0; border-radius: 5px; }
         .error { color: red; }
         .success { color: green; font-weight: bold; }
+        .note { background: #fff3cd; padding: 10px; border-left: 4px solid #ffc107; margin: 10px 0; }
     </style>
 </head>
 <body>
-    <h1>🔍 Get Telegram Channel ID (Public Channels Only)</h1>
-    <p>Enter your channel username (with or without @):</p>
+    <h1>🔍 Get Telegram Channel ID</h1>
+    <div class="note">
+        <strong>Note:</strong> This tool only works for <strong>public channels</strong> (with @username).
+        <br>For private channels, use the invite link directly in your n8n workflow.
+    </div>
+    <p>Enter your public channel username (with or without @):</p>
     <input type="text" id="username" placeholder="@moviessquares or moviessquares" />
     <button onclick="getID()">Get ID</button>
     <div id="result"></div>
@@ -368,7 +433,7 @@ def get_id_page():
 
 @app.route('/api/get-id', methods=['POST'])
 def api_get_id():
-    """API endpoint to resolve username to ID (public channels)"""
+    """API endpoint to resolve public channel username to ID"""
     try:
         username = request.json.get('username', '').strip()
         if not username:
@@ -398,7 +463,7 @@ def api_get_id():
 @app.route('/check-private/<chat_id>')
 def check_private_channel(chat_id):
     """
-    Check if bot can access a private channel by numeric ID
+    Check if bot can access a private channel
     Visit: https://your-url.onrender.com/check-private/-1003558592981
     """
     try:
@@ -419,13 +484,13 @@ def check_private_channel(chat_id):
                     # Try to get chat info
                     chat = await app.get_chat(chat_id_int)
                     
-                    # Try to get chat member count (requires access)
+                    # Try to get member count
                     try:
                         member_count = await app.get_chat_members_count(chat_id_int)
                     except:
                         member_count = "Unknown"
                     
-                    # Try to get bot's status in the channel
+                    # Try to get bot's status
                     try:
                         me = await app.get_me()
                         member = await app.get_chat_member(chat_id_int, me.id)
@@ -441,15 +506,14 @@ def check_private_channel(chat_id):
                         "type": str(chat.type),
                         "username": chat.username,
                         "members": member_count,
-                        "bot_status": bot_status,
-                        "description": chat.description[:100] if chat.description else None
+                        "bot_status": bot_status
                     }
                 except ChannelPrivate:
                     return {
                         "success": False,
                         "access": "❌ Bot cannot access this private channel",
                         "error": "ChannelPrivate",
-                        "solution": "Add the bot as an administrator to this channel"
+                        "solution": "Add the bot as an administrator or use the invite link"
                     }
                 except Exception as e:
                     return {
@@ -466,7 +530,7 @@ def check_private_channel(chat_id):
         if request.args.get('format') == 'json':
             return jsonify(result)
         
-        # Return HTML for better readability
+        # Return HTML
         if result.get('success'):
             html = f"""
 <!DOCTYPE html>
@@ -487,7 +551,7 @@ def check_private_channel(chat_id):
         <p><strong>ID:</strong> {result['id']}</p>
         <p><strong>Title:</strong> {result['title']}</p>
         <p><strong>Type:</strong> {result['type']}</p>
-        <p><strong>Username:</strong> {result.get('username', 'N/A (Private Channel)')}</p>
+        <p><strong>Username:</strong> {result.get('username', 'N/A (Private)')}</p>
         <p><strong>Members:</strong> {result.get('members', 'N/A')}</p>
         <p><strong>Bot Status:</strong> {result.get('bot_status', 'N/A')}</p>
     </div>
@@ -513,20 +577,17 @@ def check_private_channel(chat_id):
     <h1>🔍 Channel Access Test</h1>
     <p class="error">{result['access']}</p>
     <div class="solution">
-        <h3>🔧 How to Fix:</h3>
+        <h3>🔧 Solution:</h3>
+        <p><strong>Use the invite link instead of numeric ID!</strong></p>
         <ol>
-            <li>Open your <strong>private channel</strong> in Telegram</li>
-            <li>Tap/click the channel name at the top</li>
-            <li>Go to <strong>Administrators</strong></li>
-            <li>Click <strong>Add Administrator</strong></li>
-            <li>Search for your bot (check @BotFather to find the username)</li>
-            <li>Give it <strong>"Post Messages"</strong> permission</li>
-            <li>Click <strong>Save</strong></li>
-            <li>Refresh this page to verify</li>
+            <li>Open your private channel in Telegram</li>
+            <li>Go to channel settings → <strong>Invite Links</strong></li>
+            <li>Copy the invite link (https://t.me/+...)</li>
+            <li>Use that link in your n8n workflow's chat_id field</li>
         </ol>
+        <p>The invite link will force the bot to refresh access on every request.</p>
     </div>
-    <p><strong>Error Details:</strong></p>
-    <p><code>{result.get('error', 'Unknown')}</code></p>
+    <p><strong>Error:</strong> {result.get('error', 'Unknown')}</p>
     <p><strong>Error Type:</strong> {result.get('error_type', 'N/A')}</p>
 </body>
 </html>
@@ -536,6 +597,104 @@ def check_private_channel(chat_id):
         
     except ValueError:
         return jsonify({"error": "Invalid chat ID format. Use numeric ID like -1003558592981"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --- FORCE JOIN ROUTE (SESSION REFRESH) ---
+@app.route('/force-join/<chat_id>')
+def force_join(chat_id):
+    """
+    Force bot to refresh access to a channel
+    Visit: https://your-url.onrender.com/force-join/-1003558592981
+    """
+    try:
+        chat_id_int = int(chat_id)
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def do_join():
+            async with Client(
+                "bot_session", 
+                api_id=API_ID, 
+                api_hash=API_HASH, 
+                bot_token=BOT_TOKEN, 
+                workdir="/tmp"
+            ) as app:
+                try:
+                    print(f"Attempting to fetch messages from {chat_id_int}...", flush=True)
+                    async for message in app.get_chat_history(chat_id_int, limit=1):
+                        print(f"✅ Successfully accessed message: {message.id}", flush=True)
+                        return {
+                            "success": True,
+                            "method": "get_chat_history",
+                            "message": "Bot can now access the channel",
+                            "chat_id": chat_id_int
+                        }
+                    
+                    chat = await app.get_chat(chat_id_int)
+                    return {
+                        "success": True,
+                        "method": "get_chat",
+                        "title": chat.title,
+                        "chat_id": chat_id_int
+                    }
+                    
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
+        
+        result = loop.run_until_complete(do_join())
+        loop.close()
+        
+        if result.get('success'):
+            html = f"""
+<!DOCTYPE html>
+<html>
+<head><title>Force Join Result</title>
+<style>
+    body {{ font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }}
+    .success {{ color: green; font-size: 20px; font-weight: bold; }}
+</style>
+</head>
+<body>
+    <h1>✅ Success!</h1>
+    <p class="success">Bot session updated successfully</p>
+    <p><strong>Chat ID:</strong> {result['chat_id']}</p>
+    <p><strong>Method:</strong> {result.get('method', 'N/A')}</p>
+    <p>You can now try uploading to this channel.</p>
+    <p><a href="/check-private/{chat_id}">Re-check access</a></p>
+</body>
+</html>
+            """
+        else:
+            html = f"""
+<!DOCTYPE html>
+<html>
+<head><title>Force Join Result</title>
+<style>
+    body {{ font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }}
+    .error {{ color: red; }}
+</style>
+</head>
+<body>
+    <h1>❌ Failed</h1>
+    <p class="error">Could not access channel</p>
+    <p><strong>Error:</strong> {result.get('error', 'Unknown')}</p>
+    <p><strong>Error Type:</strong> {result.get('error_type', 'N/A')}</p>
+    <h3>Solution:</h3>
+    <p>Use the <strong>invite link</strong> instead of numeric ID in your n8n workflow.</p>
+</body>
+</html>
+            """
+        
+        return html
+        
+    except ValueError:
+        return jsonify({"error": "Invalid chat ID"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -596,110 +755,7 @@ def get_link():
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-# Add this route BEFORE the "if __name__ == '__main__':" line
 
-@app.route('/force-join/<chat_id>')
-def force_join(chat_id):
-    """
-    Force bot to join/refresh access to a private channel
-    This updates the session with the access hash
-    """
-    try:
-        chat_id_int = int(chat_id)
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        async def do_join():
-            async with Client(
-                "bot_session", 
-                api_id=API_ID, 
-                api_hash=API_HASH, 
-                bot_token=BOT_TOKEN, 
-                workdir="/tmp"
-            ) as app:
-                try:
-                    # Method 1: Try to get recent messages (this populates access hash)
-                    print(f"Attempting to fetch messages from {chat_id_int}...", flush=True)
-                    async for message in app.get_chat_history(chat_id_int, limit=1):
-                        print(f"✅ Successfully accessed message: {message.id}", flush=True)
-                        return {
-                            "success": True,
-                            "method": "get_chat_history",
-                            "message": "Bot can now access the channel",
-                            "chat_id": chat_id_int
-                        }
-                    
-                    # If no messages, try get_chat
-                    chat = await app.get_chat(chat_id_int)
-                    return {
-                        "success": True,
-                        "method": "get_chat",
-                        "title": chat.title,
-                        "chat_id": chat_id_int
-                    }
-                    
-                except Exception as e:
-                    return {
-                        "success": False,
-                        "error": str(e),
-                        "error_type": type(e).__name__
-                    }
-        
-        result = loop.run_until_complete(do_join())
-        loop.close()
-        
-        if result.get('success'):
-            html = f"""
-<!DOCTYPE html>
-<html>
-<head><title>Force Join Result</title>
-<style>
-    body {{ font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }}
-    .success {{ color: green; font-size: 20px; font-weight: bold; }}
-</style>
-</head>
-<body>
-    <h1>✅ Success!</h1>
-    <p class="success">Bot session updated successfully</p>
-    <p><strong>Chat ID:</strong> {result['chat_id']}</p>
-    <p><strong>Method:</strong> {result.get('method', 'N/A')}</p>
-    <p>You can now try uploading to this channel.</p>
-    <p><a href="/check-private/{chat_id}">Re-check access</a></p>
-</body>
-</html>
-            """
-        else:
-            html = f"""
-<!DOCTYPE html>
-<html>
-<head><title>Force Join Result</title>
-<style>
-    body {{ font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }}
-    .error {{ color: red; }}
-</style>
-</head>
-<body>
-    <h1>❌ Failed</h1>
-    <p class="error">Could not access channel</p>
-    <p><strong>Error:</strong> {result.get('error', 'Unknown')}</p>
-    <p><strong>Error Type:</strong> {result.get('error_type', 'N/A')}</p>
-    <h3>Possible Reasons:</h3>
-    <ul>
-        <li>Bot is not actually added as admin (double-check in Telegram)</li>
-        <li>Wrong chat ID (verify it's the correct channel)</li>
-        <li>Bot was banned/removed</li>
-    </ul>
-</body>
-</html>
-            """
-        
-        return html
-        
-    except ValueError:
-        return jsonify({"error": "Invalid chat ID"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 if __name__ == '__main__':
     print("=" * 50, flush=True)
     print("🚀 Seedr-Telegram Bridge Starting", flush=True)
