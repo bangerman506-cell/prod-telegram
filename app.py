@@ -51,15 +51,20 @@ class SmartStream(IOBase):
         self._closed = False
     
     def read(self, size=-1):
-        if self._closed: raise ValueError("I/O closed")
+        if self._closed: 
+            raise ValueError("I/O closed")
         data = self.raw.read(size)
-        if data: self.current_pos += len(data)
+        if data: 
+            self.current_pos += len(data)
         return data
     
     def seek(self, offset, whence=0):
-        if whence == 0: self.current_pos = offset
-        elif whence == 1: self.current_pos += offset
-        elif whence == 2: self.current_pos = self.total_size + offset
+        if whence == 0: 
+            self.current_pos = offset
+        elif whence == 1: 
+            self.current_pos += offset
+        elif whence == 2: 
+            self.current_pos = self.total_size + offset
         return self.current_pos
     
     def tell(self): 
@@ -135,7 +140,7 @@ async def perform_upload(file_url, chat_target, caption, filename):
         if not final_chat_id:
             raise Exception("Could not resolve chat ID")
         
-        # --- UPLOAD ---
+        # --- UPLOAD VIDEO ---
         with SmartStream(file_url, filename) as stream:
             if stream.total_size == 0:
                 raise Exception("File size is 0. Seedr link expired.")
@@ -169,9 +174,9 @@ async def perform_upload(file_url, chat_target, caption, filename):
                 }
                 
             except ChatAdminRequired:
-                raise Exception("Bot is not admin in this channel. Please promote it.")
+                raise Exception("Bot is not an admin in this channel. Please promote the bot.")
             except ChannelPrivate:
-                raise Exception("Bot has no access to this private channel. Add it as admin.")
+                raise Exception("Bot has no access to this private channel. Add it as admin first.")
             except FloodWait as e:
                 raise Exception(f"Telegram rate limit. Wait {e.value}s.")
             except Exception as e:
@@ -184,7 +189,7 @@ WORKER_THREAD = None
 WORKER_LOCK = threading.Lock()
 
 def worker_loop():
-    """Background worker"""
+    """Background worker that processes upload queue"""
     print("SYSTEM: Queue Worker Started", flush=True)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -226,7 +231,7 @@ def worker_loop():
                     del JOBS[old_id]
 
 def ensure_worker_alive():
-    """Start worker thread"""
+    """Start worker thread if not running (thread-safe)"""
     global WORKER_THREAD
     with WORKER_LOCK:
         if WORKER_THREAD is None or not WORKER_THREAD.is_alive():
@@ -234,9 +239,10 @@ def ensure_worker_alive():
             WORKER_THREAD = threading.Thread(target=worker_loop, daemon=True)
             WORKER_THREAD.start()
 
-# --- ROUTES ---
+# --- FLASK ROUTES ---
 @app.route('/')
 def home(): 
+    """Health check endpoint"""
     ensure_worker_alive()
     return jsonify({
         "status": "online",
@@ -248,32 +254,47 @@ def home():
 @app.route('/upload-telegram', methods=['POST'])
 def upload_telegram():
     """
-    POST /upload-telegram
-    Body: {
-        "url": "https://...",
-        "chat_id": "-1001234567890" or "@channel",
-        "caption": "Title (1080p)",
+    Upload video to Telegram
+    POST Body:
+    {
+        "url": "https://seedr.cc/...",
+        "chat_id": "-1003558592981" OR "@moviessquares",
+        "caption": "Movie Title (1080p)",
         "filename": "movie.mp4"
     }
     """
     data = request.json
-    if not data or not data.get('url') or not data.get('chat_id'):
-        return jsonify({"error": "Missing url or chat_id"}), 400
+    
+    if not data or not data.get('url'):
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+    if not data.get('chat_id'):
+        return jsonify({"error": "Missing 'chat_id' parameter"}), 400
     
     ensure_worker_alive()
+    
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {'status': 'queued', 'created': time.time()}
+    JOBS[job_id] = {
+        'status': 'queued',
+        'created': time.time()
+    }
     JOB_QUEUE.put((job_id, data))
     
     print(f"API: Job {job_id} queued", flush=True)
-    return jsonify({"job_id": job_id, "status": "queued"})
+    
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued"
+    })
 
 @app.route('/job-status/<job_id>', methods=['GET'])
 def job_status(job_id):
+    """Check job status"""
     ensure_worker_alive()
+    
     job = JOBS.get(job_id)
     if not job:
         return jsonify({"status": "not_found"}), 404
+    
     return jsonify(job)
 
 # --- WEB PAGE TO GET CHAT ID ---
@@ -297,7 +318,7 @@ def get_id_page():
     </style>
 </head>
 <body>
-    <h1>🔍 Get Telegram Channel ID</h1>
+    <h1>🔍 Get Telegram Channel ID (Public Channels Only)</h1>
     <p>Enter your channel username (with or without @):</p>
     <input type="text" id="username" placeholder="@moviessquares or moviessquares" />
     <button onclick="getID()">Get ID</button>
@@ -347,7 +368,7 @@ def get_id_page():
 
 @app.route('/api/get-id', methods=['POST'])
 def api_get_id():
-    """API endpoint to resolve username to ID"""
+    """API endpoint to resolve username to ID (public channels)"""
     try:
         username = request.json.get('username', '').strip()
         if not username:
@@ -373,9 +394,155 @@ def api_get_id():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --- CHECK PRIVATE CHANNEL ACCESS ---
+@app.route('/check-private/<chat_id>')
+def check_private_channel(chat_id):
+    """
+    Check if bot can access a private channel by numeric ID
+    Visit: https://your-url.onrender.com/check-private/-1003558592981
+    """
+    try:
+        chat_id_int = int(chat_id)
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def test_access():
+            async with Client(
+                "test_session", 
+                api_id=API_ID, 
+                api_hash=API_HASH, 
+                bot_token=BOT_TOKEN, 
+                workdir="/tmp"
+            ) as app:
+                try:
+                    # Try to get chat info
+                    chat = await app.get_chat(chat_id_int)
+                    
+                    # Try to get chat member count (requires access)
+                    try:
+                        member_count = await app.get_chat_members_count(chat_id_int)
+                    except:
+                        member_count = "Unknown"
+                    
+                    # Try to get bot's status in the channel
+                    try:
+                        me = await app.get_me()
+                        member = await app.get_chat_member(chat_id_int, me.id)
+                        bot_status = str(member.status)
+                    except:
+                        bot_status = "Unknown"
+                    
+                    return {
+                        "success": True,
+                        "access": "✅ Bot has access",
+                        "id": chat.id,
+                        "title": chat.title,
+                        "type": str(chat.type),
+                        "username": chat.username,
+                        "members": member_count,
+                        "bot_status": bot_status,
+                        "description": chat.description[:100] if chat.description else None
+                    }
+                except ChannelPrivate:
+                    return {
+                        "success": False,
+                        "access": "❌ Bot cannot access this private channel",
+                        "error": "ChannelPrivate",
+                        "solution": "Add the bot as an administrator to this channel"
+                    }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "access": "❌ Error accessing channel",
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
+        
+        result = loop.run_until_complete(test_access())
+        loop.close()
+        
+        # Return JSON if requested
+        if request.args.get('format') == 'json':
+            return jsonify(result)
+        
+        # Return HTML for better readability
+        if result.get('success'):
+            html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Channel Access Check</title>
+    <style>
+        body {{ font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }}
+        .success {{ color: green; font-size: 24px; font-weight: bold; }}
+        .info {{ background: #f0f0f0; padding: 15px; border-radius: 5px; margin: 10px 0; }}
+        .code {{ background: #282c34; color: #61dafb; padding: 10px; border-radius: 5px; font-family: monospace; }}
+    </style>
+</head>
+<body>
+    <h1>🔍 Channel Access Test</h1>
+    <p class="success">{result['access']}</p>
+    <div class="info">
+        <p><strong>ID:</strong> {result['id']}</p>
+        <p><strong>Title:</strong> {result['title']}</p>
+        <p><strong>Type:</strong> {result['type']}</p>
+        <p><strong>Username:</strong> {result.get('username', 'N/A (Private Channel)')}</p>
+        <p><strong>Members:</strong> {result.get('members', 'N/A')}</p>
+        <p><strong>Bot Status:</strong> {result.get('bot_status', 'N/A')}</p>
+    </div>
+    <h3>✅ Your bot can upload to this channel!</h3>
+    <p>Use this ID in your n8n workflow:</p>
+    <div class="code">{result['id']}</div>
+</body>
+</html>
+            """
+        else:
+            html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Channel Access Check</title>
+    <style>
+        body {{ font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }}
+        .error {{ color: red; font-size: 24px; font-weight: bold; }}
+        .solution {{ background: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #ffc107; }}
+    </style>
+</head>
+<body>
+    <h1>🔍 Channel Access Test</h1>
+    <p class="error">{result['access']}</p>
+    <div class="solution">
+        <h3>🔧 How to Fix:</h3>
+        <ol>
+            <li>Open your <strong>private channel</strong> in Telegram</li>
+            <li>Tap/click the channel name at the top</li>
+            <li>Go to <strong>Administrators</strong></li>
+            <li>Click <strong>Add Administrator</strong></li>
+            <li>Search for your bot (check @BotFather to find the username)</li>
+            <li>Give it <strong>"Post Messages"</strong> permission</li>
+            <li>Click <strong>Save</strong></li>
+            <li>Refresh this page to verify</li>
+        </ol>
+    </div>
+    <p><strong>Error Details:</strong></p>
+    <p><code>{result.get('error', 'Unknown')}</code></p>
+    <p><strong>Error Type:</strong> {result.get('error_type', 'N/A')}</p>
+</body>
+</html>
+            """
+        
+        return html
+        
+    except ValueError:
+        return jsonify({"error": "Invalid chat ID format. Use numeric ID like -1003558592981"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # --- SEEDR ROUTES ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
+    """Add magnet to Seedr"""
     try:
         resp = requests.post(
             "https://www.seedr.cc/oauth_test/resource.php?json=1",
@@ -383,7 +550,8 @@ def add_magnet():
                 "access_token": request.json.get('token'),
                 "func": "add_torrent",
                 "torrent_magnet": request.json.get('magnet')
-            }
+            },
+            timeout=30
         )
         return jsonify(resp.json())
     except Exception as e:
@@ -391,20 +559,30 @@ def add_magnet():
 
 @app.route('/list-files', methods=['POST'])
 def list_files():
+    """List Seedr files in folder"""
     try:
         data = request.json
         token = data.get('token')
         folder_id = str(data.get('folder_id', "0"))
         
-        url = "https://www.seedr.cc/api/folder" if folder_id == "0" else f"https://www.seedr.cc/api/folder/{folder_id}"
+        if folder_id == "0":
+            url = "https://www.seedr.cc/api/folder"
+        else:
+            url = f"https://www.seedr.cc/api/folder/{folder_id}"
         
-        resp = requests.get(url, params={"access_token": token}, headers=HEADERS_STREAM)
+        resp = requests.get(
+            url, 
+            params={"access_token": token}, 
+            headers=HEADERS_STREAM,
+            timeout=30
+        )
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/get-link', methods=['POST'])
 def get_link():
+    """Get download link from Seedr"""
     try:
         resp = requests.post(
             "https://www.seedr.cc/oauth_test/resource.php?json=1",
@@ -412,7 +590,8 @@ def get_link():
                 "access_token": request.json.get('token'),
                 "func": "fetch_file",
                 "folder_file_id": str(request.json.get('file_id'))
-            }
+            },
+            timeout=30
         )
         return jsonify(resp.json())
     except Exception as e:
