@@ -112,16 +112,30 @@ async def perform_upload(data):
     except:
         pass
 
-    # Use /tmp for session persistence to avoid "Peer Invalid" on restarts
+    # Use /tmp to try and keep some cache, but we will force sync if needed
     async with Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir="/tmp") as app:
+        
+        # --- THE FIX: DIALOG SYNC ---
+        # If we can't find the chat immediately, we refresh the bot's memory
         try:
-            print(f"WORKER: Resolving {target}...", flush=True)
+            print(f"WORKER: Verifying target {target}...", flush=True)
             chat = await app.get_chat(target)
             target = chat.id
-            print(f"WORKER: Target resolved: {chat.title}", flush=True)
-        except:
-            print("WORKER: Could not resolve peer, trying blind upload...", flush=True)
+            print(f"WORKER: Target confirmed: {chat.title}", flush=True)
+        except Exception as e:
+            print(f"WORKER: Target not found in cache ({e}). Syncing Dialogs...", flush=True)
+            found = False
+            # Fetch the last 100 dialogs (channels/groups the bot is in)
+            async for dialog in app.get_dialogs(limit=100):
+                if dialog.chat.id == target:
+                    print(f"WORKER: Found target in Dialogs: {dialog.chat.title}", flush=True)
+                    found = True
+                    break
+            
+            if not found:
+                raise Exception(f"Bot cannot find chat {target}. Make sure Bot is Admin in the Private Channel!")
 
+        # --- UPLOAD ---
         with SmartStream(file_url, filename) as stream:
             if stream.total_size == 0:
                 raise Exception("File size 0. Link expired.")
@@ -133,13 +147,18 @@ async def perform_upload(data):
                 caption=caption,
                 supports_streaming=True,
                 file_name=filename,
-                progress=lambda c, t: print(f"Up: {c/1024/1024:.1f}MB") if c % (10*1024*1024) == 0 else None
+                progress=lambda c, t: print(f"Up: {c/1024/1024:.1f}MB") if c % (20*1024*1024) == 0 else None
             )
+            
+            # Return link to the private message
+            # For private channels (ID starts with -100), link format is /c/ID/MSG_ID
+            clean_id = str(msg.chat.id).replace('-100', '')
+            private_link = f"https://t.me/c/{clean_id}/{msg.id}"
             
             return {
                 "message_id": msg.id,
                 "chat_id": msg.chat.id,
-                "link": f"https://t.me/c/{str(msg.chat.id).replace('-100', '')}/{msg.id}"
+                "link": private_link
             }
 
 def ensure_worker_alive():
@@ -178,7 +197,7 @@ def job_status(job_id):
     if not job: return jsonify({"status": "not_found"}), 404
     return jsonify(job)
 
-# --- SEEDR ROUTES ---
+# --- SEEDR ROUTES (WORKING) ---
 @app.route('/auth/code', methods=['GET'])
 def get_code():
     try:
