@@ -337,11 +337,12 @@ def home():
         "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False
     })
 
+# ✅ FIX #1: UPDATED SESSION ROUTES
 @app.route('/start-session', methods=['POST'])
 def start_session():
     """Start message collection session"""
     data = request.json
-    poster_msg_id = data.get('poster_message_id')
+    poster_msg_id = str(data.get('poster_message_id'))  # ✅ Force string
     
     with SESSION_LOCK:
         MESSAGE_SESSIONS[poster_msg_id] = {
@@ -352,19 +353,20 @@ def start_session():
             'status': 'collecting'
         }
     
-    print(f"SESSION: Started {poster_msg_id}", flush=True)
+    print(f"SESSION: Started \"{poster_msg_id}\"", flush=True)
     return jsonify({"status": "session_started", "poster_msg_id": poster_msg_id})
 
 @app.route('/add-magnet-to-session', methods=['POST'])
 def add_magnet_to_session():
     """Add magnet to session"""
     data = request.json
-    poster_msg_id = data.get('poster_message_id')
+    poster_msg_id = str(data.get('poster_message_id'))  # ✅ Force string
     magnet = data.get('magnet')
     
     with SESSION_LOCK:
         if poster_msg_id not in MESSAGE_SESSIONS:
-            return jsonify({"error": "Session not found"}), 404
+            print(f"SESSION ERROR: \"{poster_msg_id}\" not found. Available: {list(MESSAGE_SESSIONS.keys())}", flush=True)
+            return jsonify({"error": "Session not found", "session_id": poster_msg_id}), 404
         
         session = MESSAGE_SESSIONS[poster_msg_id]
         
@@ -376,13 +378,15 @@ def add_magnet_to_session():
             return jsonify({"error": "max_magnets", "message": "⚠️ Maximum 3 qualities allowed."}), 400
         
         session['magnets'].append(magnet)
-        print(f"SESSION: Added magnet {len(session['magnets'])}/3 to {poster_msg_id}", flush=True)
+        print(f"SESSION: Added magnet {len(session['magnets'])}/3 to \"{poster_msg_id}\"", flush=True)
     
     return jsonify({"status": "magnet_added", "count": len(session['magnets'])})
 
 @app.route('/get-session/<poster_msg_id>', methods=['GET'])
 def get_session(poster_msg_id):
     """Get session data"""
+    poster_msg_id = str(poster_msg_id)  # ✅ Force string
+    
     with SESSION_LOCK:
         if poster_msg_id not in MESSAGE_SESSIONS:
             return jsonify({"error": "Session not found"}), 404
@@ -399,11 +403,12 @@ def get_session(poster_msg_id):
 def complete_session():
     """Mark session as complete and return data"""
     data = request.json
-    poster_msg_id = data.get('poster_message_id')
+    poster_msg_id = str(data.get('poster_message_id'))  # ✅ Force string
     
     with SESSION_LOCK:
         if poster_msg_id not in MESSAGE_SESSIONS:
-            return jsonify({"error": "Session not found"}), 404
+            print(f"SESSION ERROR: \"{poster_msg_id}\" not found. Available: {list(MESSAGE_SESSIONS.keys())}", flush=True)
+            return jsonify({"error": "Session not found", "session_id": poster_msg_id}), 404
         
         session = MESSAGE_SESSIONS[poster_msg_id]
         
@@ -417,9 +422,24 @@ def complete_session():
         }
         
         del MESSAGE_SESSIONS[poster_msg_id]
-        print(f"SESSION: Completed {poster_msg_id} with {len(session['magnets'])} magnets", flush=True)
+        print(f"SESSION: Completed \"{poster_msg_id}\" with {len(session['magnets'])} magnets", flush=True)
         
         return jsonify(result)
+
+# ✅ NEW: DEBUG ENDPOINT
+@app.route('/debug/sessions', methods=['GET'])
+def debug_sessions():
+    """Debug: Show all active sessions"""
+    with SESSION_LOCK:
+        return jsonify({
+            "active_sessions": list(MESSAGE_SESSIONS.keys()),
+            "session_data": {k: {
+                "magnets": len(v['magnets']),
+                "created": v['created'],
+                "timeout": v['timeout'],
+                "time_left": int(v['timeout'] - time.time())
+            } for k, v in MESSAGE_SESSIONS.items()}
+        })
 
 @app.route('/upload-telegram', methods=['POST'])
 def upload_telegram():
@@ -571,22 +591,39 @@ def get_link():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ✅ FIX #3: UPDATED DELETE FOLDER ROUTE
 @app.route('/delete-folder', methods=['POST'])
 def delete_folder():
     """Delete folder from Seedr"""
     try:
+        folder_id = request.json.get('folder_id')
+        
+        # ✅ Validate folder_id
+        if not folder_id or folder_id == 'null' or folder_id == 'None' or str(folder_id).lower() == 'none':
+            print(f"SEEDR ERROR: Invalid folder_id: {folder_id}", flush=True)
+            return jsonify({"error": "Invalid folder_id", "received": str(folder_id)}), 400
+        
+        # Convert to string (Seedr expects string)
+        folder_id = str(folder_id)
+        
+        print(f"SEEDR: Attempting to delete folder \"{folder_id}\"", flush=True)
+        
         resp = requests.post(
             "https://www.seedr.cc/oauth_test/resource.php?json=1",
             data={
                 "access_token": request.json.get('token'),
                 "func": "delete",
-                "delete_arr": f"[{request.json.get('folder_id')}]"
+                "delete_arr": f"[{folder_id}]"
             },
             timeout=30
         )
-        print(f"SEEDR: Deleted folder {request.json.get('folder_id')}", flush=True)
-        return jsonify(resp.json())
+        
+        result = resp.json()
+        print(f"SEEDR: Delete response: {result}", flush=True)
+        
+        return jsonify(result)
     except Exception as e:
+        print(f"SEEDR ERROR: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 # --- CLEANUP EXPIRED SESSIONS ---
@@ -601,7 +638,7 @@ def cleanup_sessions():
                 expired = [k for k, v in MESSAGE_SESSIONS.items() if current_time > v['timeout']]
                 for session_id in expired:
                     del MESSAGE_SESSIONS[session_id]
-                    print(f"SESSION: Cleaned up expired {session_id}", flush=True)
+                    print(f"SESSION: Cleaned up expired \"{session_id}\"", flush=True)
         except Exception as e:
             print(f"CLEANUP ERROR: {e}", flush=True)
 
