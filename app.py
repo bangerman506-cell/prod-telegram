@@ -6,10 +6,12 @@ import queue
 import uuid
 import time
 import re
+from datetime import datetime, timedelta
 from io import IOBase
 from flask import Flask, request, jsonify
 from pyrogram import Client
 from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 app = Flask(__name__)
 
@@ -17,7 +19,7 @@ app = Flask(__name__)
 API_ID = os.environ.get("TG_API_ID")
 API_HASH = os.environ.get("TG_API_HASH")
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # Your personal chat ID for notifications
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "7197806663")
 
 if API_ID:
     try:
@@ -29,6 +31,10 @@ HEADERS_STREAM = {
     "User-Agent": "Seedr Android/1.0",
     "Content-Type": "application/x-www-form-urlencoded"
 }
+
+# Message collection storage
+MESSAGE_SESSIONS = {}  # {poster_message_id: {data}}
+SESSION_LOCK = threading.Lock()
 
 # --- 1. SMART STREAMER ---
 class SmartStream(IOBase):
@@ -83,27 +89,23 @@ class SmartStream(IOBase):
 
 # --- 2. METADATA EXTRACTION ---
 def extract_metadata_from_magnet(magnet_link):
-    """
-    Extract metadata from magnet name
-    Example: Movie.Name.2024.Tamil.1080p.WEB-DL.x264
-    """
+    """Extract metadata from magnet name"""
     try:
-        # Extract display name from magnet
         match = re.search(r'dn=([^&]+)', magnet_link)
         if not match:
             return {}
         
         name = match.group(1)
-        name = name.replace('+', ' ').replace('%20', ' ')
+        name = name.replace('+', ' ').replace('%20', ' ').replace('%28', '(').replace('%29', ')')
         
         metadata = {}
         
-        # Extract year (4 digits)
+        # Extract year
         year_match = re.search(r'(19|20)\d{2}', name)
         if year_match:
             metadata['year'] = year_match.group(0)
         
-        # Extract quality
+        # Extract quality/resolution
         quality_match = re.search(r'(480p|720p|1080p|2160p|4k)', name, re.IGNORECASE)
         if quality_match:
             metadata['resolution'] = quality_match.group(0).lower()
@@ -115,16 +117,16 @@ def extract_metadata_from_magnet(magnet_link):
                 metadata['language'] = lang
                 break
         
-        # Extract source type for quality mapping
+        # Extract source type
         if re.search(r'(WEB-DL|BluRay|WEBRip|BRRip)', name, re.IGNORECASE):
             metadata['quality_type'] = 'HD PRINT'
-        elif re.search(r'(HDTV|CAM|HDCAM|TS|TC)', name, re.IGNORECASE):
+        elif re.search(r'(HDTV|CAM|HDCAM|TS|TC|PreDVD)', name, re.IGNORECASE):
             metadata['quality_type'] = 'THEATRE PRINT'
         
-        # Clean title (remove year, quality, etc.)
+        # Clean title
         title = re.sub(r'(19|20)\d{2}', '', name)
         title = re.sub(r'(480p|720p|1080p|2160p|4k)', '', title, flags=re.IGNORECASE)
-        title = re.sub(r'(WEB-DL|BluRay|WEBRip|HDTV|CAM|x264|x265|HEVC|AAC|DTS|5\.1)', '', title, flags=re.IGNORECASE)
+        title = re.sub(r'(WEB-DL|BluRay|WEBRip|HDTV|CAM|x264|x265|HEVC|AAC|DTS|5\.1|Tamil|Telugu|Hindi|English)', '', title, flags=re.IGNORECASE)
         title = re.sub(r'[._\-]+', ' ', title).strip()
         metadata['title'] = title
         
@@ -134,14 +136,25 @@ def extract_metadata_from_magnet(magnet_link):
         print(f"Metadata extraction error: {e}", flush=True)
         return {}
 
+def detect_quality_from_size(size_bytes):
+    """Detect quality from file size"""
+    size_mb = size_bytes / (1024 * 1024)
+    
+    if size_mb < 900:
+        return '480p'
+    elif 900 <= size_mb < 1500:
+        return '720p'
+    elif 1500 <= size_mb <= 2048:
+        return '1080p'
+    else:
+        return None  # Too large
+
 # --- 3. ASYNC UPLOAD LOGIC ---
 async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=0):
-    """Upload video to Telegram with retry logic"""
+    """Upload video with retry"""
     
-    # Check file size (2GB = 2048 MB)
-    MAX_SIZE_MB = 2048
-    if file_size_mb > MAX_SIZE_MB:
-        raise Exception(f"File too large: {file_size_mb:.1f}MB (max {MAX_SIZE_MB}MB)")
+    if file_size_mb > 2048:
+        raise Exception(f"File too large: {file_size_mb:.1f}MB (max 2048MB)")
     
     max_retries = 3
     retry_count = 0
@@ -160,21 +173,15 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                 final_chat_id = None
                 chat_str = str(chat_target).strip()
                 
-                # Resolve chat
                 if chat_str.startswith("@"):
                     chat = await app.get_chat(chat_str)
                     final_chat_id = chat.id
                     print(f"WORKER: ✅ Resolved to ID: {final_chat_id}", flush=True)
                 elif chat_str.lstrip("-").isdigit():
                     final_chat_id = int(chat_str)
-                    print(f"WORKER: Using numeric ID: {final_chat_id}", flush=True)
                 else:
                     raise Exception(f"Invalid chat format: {chat_str}")
                 
-                if not final_chat_id:
-                    raise Exception("Could not resolve chat ID")
-                
-                # Upload video
                 with SmartStream(file_url, filename) as stream:
                     if stream.total_size == 0:
                         raise Exception("File size is 0. Seedr link expired.")
@@ -193,7 +200,6 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                         ) if c % (50*1024*1024) < 1024*1024 else None
                     )
                     
-                    # Generate link
                     clean_id = str(msg.chat.id).replace('-100', '')
                     private_link = f"https://t.me/c/{clean_id}/{msg.id}"
                     
@@ -221,9 +227,9 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
             print(f"WORKER: Retry {retry_count}/{max_retries} due to: {e}", flush=True)
             await asyncio.sleep(5)
 
-# --- 4. SEND NOTIFICATION TO ADMIN ---
-async def send_admin_notification(message):
-    """Send private notification to admin"""
+# --- 4. SEND NOTIFICATION ---
+async def send_admin_notification(message, reply_markup=None):
+    """Send notification to admin"""
     if not ADMIN_CHAT_ID:
         print(f"NOTIFICATION: {message}", flush=True)
         return
@@ -238,9 +244,10 @@ async def send_admin_notification(message):
         ) as app:
             await app.send_message(
                 chat_id=int(ADMIN_CHAT_ID),
-                text=f"⚠️ **Admin Notification**\n\n{message}"
+                text=message,
+                reply_markup=reply_markup
             )
-            print(f"NOTIFICATION SENT: {message}", flush=True)
+            print(f"NOTIFICATION SENT", flush=True)
     except Exception as e:
         print(f"NOTIFICATION ERROR: {e}", flush=True)
 
@@ -266,16 +273,14 @@ def worker_loop():
             
             file_size_mb = data.get('file_size_mb', 0)
             
-            # Check if file is too large
             if file_size_mb > 2048:
-                # Send notification to admin
                 movie_name = data.get('caption', 'Unknown')
-                notification_msg = f"⚠️ Skipped upload for **{movie_name}**\n\n" \
+                notification_msg = f"⚠️ **Skipped Upload**\n\n" \
+                                   f"Movie: {movie_name}\n" \
                                    f"File size: {file_size_mb:.1f}MB\n" \
                                    f"Reason: Exceeds 2GB Seedr limit"
                 loop.run_until_complete(send_admin_notification(notification_msg))
-                
-                raise Exception(f"File too large: {file_size_mb:.1f}MB (max 2048MB)")
+                raise Exception(f"File too large: {file_size_mb:.1f}MB")
             
             result = loop.run_until_complete(perform_upload(
                 file_url=data['url'],
@@ -294,7 +299,6 @@ def worker_loop():
             error_msg = str(e)
             print(f"WORKER ERROR: {error_msg}", flush=True)
             
-            # Send error notification to admin
             if "failed after" in error_msg or "too large" in error_msg:
                 loop.run_until_complete(send_admin_notification(f"Job {job_id}: {error_msg}"))
             
@@ -306,7 +310,6 @@ def worker_loop():
             if job_id:
                 JOB_QUEUE.task_done()
             
-            # Cleanup old jobs
             if len(JOBS) > 100:
                 old_jobs = sorted(JOBS.items(), key=lambda x: x[1].get('created', 0))[:50]
                 for old_id, _ in old_jobs:
@@ -330,12 +333,97 @@ def home():
         "status": "online",
         "queue": JOB_QUEUE.qsize(),
         "jobs": len(JOBS),
+        "sessions": len(MESSAGE_SESSIONS),
         "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False
     })
 
+@app.route('/start-session', methods=['POST'])
+def start_session():
+    """Start message collection session"""
+    data = request.json
+    poster_msg_id = data.get('poster_message_id')
+    
+    with SESSION_LOCK:
+        MESSAGE_SESSIONS[poster_msg_id] = {
+            'created': time.time(),
+            'timeout': time.time() + 300,  # 5 minutes
+            'metadata': data.get('metadata', {}),
+            'magnets': [],
+            'status': 'collecting'
+        }
+    
+    print(f"SESSION: Started {poster_msg_id}", flush=True)
+    return jsonify({"status": "session_started", "poster_msg_id": poster_msg_id})
+
+@app.route('/add-magnet-to-session', methods=['POST'])
+def add_magnet_to_session():
+    """Add magnet to session"""
+    data = request.json
+    poster_msg_id = data.get('poster_message_id')
+    magnet = data.get('magnet')
+    
+    with SESSION_LOCK:
+        if poster_msg_id not in MESSAGE_SESSIONS:
+            return jsonify({"error": "Session not found"}), 404
+        
+        session = MESSAGE_SESSIONS[poster_msg_id]
+        
+        if time.time() > session['timeout']:
+            del MESSAGE_SESSIONS[poster_msg_id]
+            return jsonify({"error": "timeout", "message": "⏱️ Workflow timeout. Please send magnets and type 'done' to restart."}), 408
+        
+        if len(session['magnets']) >= 3:
+            return jsonify({"error": "max_magnets", "message": "⚠️ Maximum 3 qualities allowed."}), 400
+        
+        session['magnets'].append(magnet)
+        print(f"SESSION: Added magnet {len(session['magnets'])}/3 to {poster_msg_id}", flush=True)
+    
+    return jsonify({"status": "magnet_added", "count": len(session['magnets'])})
+
+@app.route('/get-session/<poster_msg_id>', methods=['GET'])
+def get_session(poster_msg_id):
+    """Get session data"""
+    with SESSION_LOCK:
+        if poster_msg_id not in MESSAGE_SESSIONS:
+            return jsonify({"error": "Session not found"}), 404
+        
+        session = MESSAGE_SESSIONS[poster_msg_id]
+        
+        if time.time() > session['timeout']:
+            del MESSAGE_SESSIONS[poster_msg_id]
+            return jsonify({"error": "timeout"}), 408
+        
+        return jsonify(session)
+
+@app.route('/complete-session', methods=['POST'])
+def complete_session():
+    """Mark session as complete and return data"""
+    data = request.json
+    poster_msg_id = data.get('poster_message_id')
+    
+    with SESSION_LOCK:
+        if poster_msg_id not in MESSAGE_SESSIONS:
+            return jsonify({"error": "Session not found"}), 404
+        
+        session = MESSAGE_SESSIONS[poster_msg_id]
+        
+        if len(session['magnets']) < 1:
+            return jsonify({"error": "no_magnets", "message": "⚠️ No magnet links found. Please send at least 1 magnet link."}), 400
+        
+        result = {
+            'metadata': session['metadata'],
+            'magnets': session['magnets'],
+            'count': len(session['magnets'])
+        }
+        
+        del MESSAGE_SESSIONS[poster_msg_id]
+        print(f"SESSION: Completed {poster_msg_id} with {len(session['magnets'])} magnets", flush=True)
+        
+        return jsonify(result)
+
 @app.route('/upload-telegram', methods=['POST'])
 def upload_telegram():
-    """Upload video to Telegram"""
+    """Upload video"""
     data = request.json
     
     if not data or not data.get('url'):
@@ -352,27 +440,20 @@ def upload_telegram():
     }
     JOB_QUEUE.put((job_id, data))
     
-    print(f"API: Job {job_id} queued", flush=True)
-    
-    return jsonify({
-        "job_id": job_id,
-        "status": "queued"
-    })
+    return jsonify({"job_id": job_id, "status": "queued"})
 
 @app.route('/job-status/<job_id>', methods=['GET'])
 def job_status(job_id):
     """Check job status"""
     ensure_worker_alive()
-    
     job = JOBS.get(job_id)
     if not job:
         return jsonify({"status": "not_found"}), 404
-    
     return jsonify(job)
 
 @app.route('/extract-metadata', methods=['POST'])
 def extract_metadata():
-    """Extract metadata from magnet link"""
+    """Extract metadata from magnet"""
     try:
         magnet = request.json.get('magnet', '')
         metadata = extract_metadata_from_magnet(magnet)
@@ -380,12 +461,23 @@ def extract_metadata():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- SEEDR ROUTES ---
+@app.route('/detect-quality-from-size', methods=['POST'])
+def detect_quality_api():
+    """Detect quality from file size"""
+    try:
+        size_bytes = int(request.json.get('size_bytes', 0))
+        quality = detect_quality_from_size(size_bytes)
+        return jsonify({"quality": quality})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --- SEEDR ROUTES WITH RETRY ---
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     """Add magnet to Seedr with retry"""
     max_retries = 3
     retry_count = 0
+    last_error = None
     
     while retry_count < max_retries:
         try:
@@ -398,39 +490,69 @@ def add_magnet():
                 },
                 timeout=30
             )
-            return jsonify(resp.json())
+            result = resp.json()
+            
+            if 'error' in result or result.get('result') == False:
+                raise Exception(result.get('error', 'Unknown Seedr error'))
+            
+            return jsonify(result)
+            
         except Exception as e:
+            last_error = str(e)
             retry_count += 1
-            if retry_count >= max_retries:
-                # Send notification to admin
+            if retry_count < max_retries:
+                print(f"SEEDR: Add magnet retry {retry_count}/{max_retries}", flush=True)
+                time.sleep(10)
+            else:
                 asyncio.run(send_admin_notification(
-                    f"Seedr add-magnet failed after {max_retries} retries:\n{str(e)}"
+                    f"⚠️ **Seedr Add Magnet Failed**\n\n"
+                    f"Retries: {max_retries}/{max_retries}\n"
+                    f"Error: {last_error}\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
                 ))
-                return jsonify({"error": str(e)}), 500
-            time.sleep(2)
+                return jsonify({"error": last_error, "retries": max_retries}), 500
 
 @app.route('/list-files', methods=['POST'])
 def list_files():
-    """List Seedr files"""
-    try:
-        data = request.json
-        token = data.get('token')
-        folder_id = str(data.get('folder_id', "0"))
-        
-        if folder_id == "0":
-            url = "https://www.seedr.cc/api/folder"
-        else:
-            url = f"https://www.seedr.cc/api/folder/{folder_id}"
-        
-        resp = requests.get(
-            url, 
-            params={"access_token": token}, 
-            headers=HEADERS_STREAM,
-            timeout=30
-        )
-        return jsonify(resp.json())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    """List Seedr files with retry"""
+    max_retries = 3
+    retry_count = 0
+    last_error = None
+    
+    while retry_count < max_retries:
+        try:
+            data = request.json
+            token = data.get('token')
+            folder_id = str(data.get('folder_id', "0"))
+            
+            if folder_id == "0":
+                url = "https://www.seedr.cc/api/folder"
+            else:
+                url = f"https://www.seedr.cc/api/folder/{folder_id}"
+            
+            resp = requests.get(
+                url, 
+                params={"access_token": token}, 
+                headers=HEADERS_STREAM,
+                timeout=30
+            )
+            result = resp.json()
+            
+            # Check if files exist
+            if 'folders' in result and len(result.get('folders', [])) == 0 and len(result.get('files', [])) == 0:
+                if retry_count < max_retries - 1:
+                    raise Exception("No files found yet")
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            last_error = str(e)
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"SEEDR: List files retry {retry_count}/{max_retries}", flush=True)
+                time.sleep(10)
+            else:
+                return jsonify({"error": last_error, "retries": max_retries}), 500
 
 @app.route('/get-link', methods=['POST'])
 def get_link():
@@ -451,7 +573,7 @@ def get_link():
 
 @app.route('/delete-folder', methods=['POST'])
 def delete_folder():
-    """Delete folder from Seedr to free space"""
+    """Delete folder from Seedr"""
     try:
         resp = requests.post(
             "https://www.seedr.cc/oauth_test/resource.php?json=1",
@@ -466,6 +588,26 @@ def delete_folder():
         return jsonify(resp.json())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# --- CLEANUP EXPIRED SESSIONS ---
+def cleanup_sessions():
+    """Remove expired sessions"""
+    while True:
+        try:
+            time.sleep(60)  # Check every minute
+            current_time = time.time()
+            
+            with SESSION_LOCK:
+                expired = [k for k, v in MESSAGE_SESSIONS.items() if current_time > v['timeout']]
+                for session_id in expired:
+                    del MESSAGE_SESSIONS[session_id]
+                    print(f"SESSION: Cleaned up expired {session_id}", flush=True)
+        except Exception as e:
+            print(f"CLEANUP ERROR: {e}", flush=True)
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
+cleanup_thread.start()
 
 if __name__ == '__main__':
     print("=" * 50, flush=True)
