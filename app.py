@@ -7,7 +7,7 @@ import uuid
 import time
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import IOBase
 from flask import Flask, request, jsonify
 from pyrogram import Client
@@ -34,10 +34,129 @@ HEADERS_STREAM = {
 }
 
 # Message collection storage
-MESSAGE_SESSIONS = {}  # {poster_message_id: {data}}
+MESSAGE_SESSIONS = {}
 SESSION_LOCK = threading.Lock()
 
-# --- 1. SMART STREAMER ---
+# --- PIKPAK ACCOUNT MANAGEMENT ---
+PIKPAK_ACCOUNTS = [
+    {
+        "email": os.environ.get("PIKPAK_EMAIL_1"),
+        "password": os.environ.get("PIKPAK_PASSWORD_1"),
+        "access_token": None,
+        "refresh_token": None,
+        "daily_used": 0,
+        "last_reset": None
+    },
+    {
+        "email": os.environ.get("PIKPAK_EMAIL_2"),
+        "password": os.environ.get("PIKPAK_PASSWORD_2"),
+        "access_token": None,
+        "refresh_token": None,
+        "daily_used": 0,
+        "last_reset": None
+    },
+    {
+        "email": os.environ.get("PIKPAK_EMAIL_3"),
+        "password": os.environ.get("PIKPAK_PASSWORD_3"),
+        "access_token": None,
+        "refresh_token": None,
+        "daily_used": 0,
+        "last_reset": None
+    },
+    {
+        "email": os.environ.get("PIKPAK_EMAIL_4"),
+        "password": os.environ.get("PIKPAK_PASSWORD_4"),
+        "access_token": None,
+        "refresh_token": None,
+        "daily_used": 0,
+        "last_reset": None
+    }
+]
+
+ACCOUNT_LOCK = threading.Lock()
+
+def reset_daily_counters():
+    """Reset daily usage at midnight UTC"""
+    now = datetime.now(timezone.utc)
+    
+    with ACCOUNT_LOCK:
+        for account in PIKPAK_ACCOUNTS:
+            if not account.get('email'):
+                continue
+                
+            last_reset = account.get('last_reset')
+            
+            # Reset if never reset or different day
+            if not last_reset or last_reset.date() < now.date():
+                account['daily_used'] = 0
+                account['last_reset'] = now
+                print(f"PIKPAK: Reset counter for {account['email']}", flush=True)
+
+def get_available_account():
+    """Get account with available daily quota"""
+    reset_daily_counters()
+    
+    with ACCOUNT_LOCK:
+        for i, account in enumerate(PIKPAK_ACCOUNTS):
+            if not account.get('email'):
+                continue
+            
+            if account['daily_used'] < 5:
+                print(f"PIKPAK: Using account {i+1} ({account['email']}) - Used: {account['daily_used']}/5", flush=True)
+                return account, i
+        
+        print(f"PIKPAK ERROR: All accounts exhausted for today!", flush=True)
+        return None, None
+
+def increment_account_usage(account_index):
+    """Increment usage counter for account"""
+    with ACCOUNT_LOCK:
+        if 0 <= account_index < len(PIKPAK_ACCOUNTS):
+            PIKPAK_ACCOUNTS[account_index]['daily_used'] += 1
+            print(f"PIKPAK: Account {account_index+1} now at {PIKPAK_ACCOUNTS[account_index]['daily_used']}/5", flush=True)
+
+def pikpak_login(account):
+    """Login to PikPak and get access token"""
+    try:
+        print(f"PIKPAK: Logging in as {account['email']}...", flush=True)
+        
+        resp = requests.post(
+            "https://user.mypikpak.com/v1/auth/signin",
+            json={
+                "email": account['email'],
+                "password": account['password']
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        
+        data = resp.json()
+        
+        if 'access_token' not in data:
+            raise Exception(f"Login failed: {data.get('error_description', 'Unknown error')}")
+        
+        account['access_token'] = data['access_token']
+        account['refresh_token'] = data.get('refresh_token')
+        
+        print(f"PIKPAK: ✅ Login successful for {account['email']}", flush=True)
+        return account['access_token']
+        
+    except Exception as e:
+        print(f"PIKPAK LOGIN ERROR: {e}", flush=True)
+        return None
+
+def get_pikpak_headers(account):
+    """Get headers with valid access token"""
+    if not account.get('access_token'):
+        pikpak_login(account)
+    
+    return {
+        "Authorization": f"Bearer {account['access_token']}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
+
+# --- SMART STREAMER ---
 class SmartStream(IOBase):
     def __init__(self, url, name):
         super().__init__()
@@ -88,7 +207,7 @@ class SmartStream(IOBase):
     def fileno(self): 
         return None
 
-# --- 2. METADATA EXTRACTION ---
+# --- METADATA EXTRACTION ---
 def extract_metadata_from_magnet(magnet_link):
     """Extract metadata from magnet name"""
     try:
@@ -101,30 +220,25 @@ def extract_metadata_from_magnet(magnet_link):
         
         metadata = {}
         
-        # Extract year
         year_match = re.search(r'(19|20)\d{2}', name)
         if year_match:
             metadata['year'] = year_match.group(0)
         
-        # Extract quality/resolution
         quality_match = re.search(r'(480p|720p|1080p|2160p|4k)', name, re.IGNORECASE)
         if quality_match:
             metadata['resolution'] = quality_match.group(0).lower()
         
-        # Extract language
         languages = ['Tamil', 'Telugu', 'Hindi', 'English', 'Malayalam', 'Kannada']
         for lang in languages:
             if re.search(lang, name, re.IGNORECASE):
                 metadata['language'] = lang
                 break
         
-        # Extract source type
         if re.search(r'(WEB-DL|BluRay|WEBRip|BRRip)', name, re.IGNORECASE):
             metadata['quality_type'] = 'HD PRINT'
         elif re.search(r'(HDTV|CAM|HDCAM|TS|TC|PreDVD)', name, re.IGNORECASE):
             metadata['quality_type'] = 'THEATRE PRINT'
         
-        # Clean title
         title = re.sub(r'(19|20)\d{2}', '', name)
         title = re.sub(r'(480p|720p|1080p|2160p|4k)', '', title, flags=re.IGNORECASE)
         title = re.sub(r'(WEB-DL|BluRay|WEBRip|HDTV|CAM|x264|x265|HEVC|AAC|DTS|5\.1|Tamil|Telugu|Hindi|English)', '', title, flags=re.IGNORECASE)
@@ -148,9 +262,9 @@ def detect_quality_from_size(size_bytes):
     elif 1500 <= size_mb <= 2048:
         return '1080p'
     else:
-        return None  # Too large
+        return None
 
-# --- 3. ASYNC UPLOAD LOGIC ---
+# --- ASYNC UPLOAD LOGIC ---
 async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=0):
     """Upload video with retry"""
     
@@ -228,7 +342,7 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
             print(f"WORKER: Retry {retry_count}/{max_retries} due to: {e}", flush=True)
             await asyncio.sleep(5)
 
-# --- 4. SEND NOTIFICATION ---
+# --- SEND NOTIFICATION ---
 async def send_admin_notification(message, reply_markup=None):
     """Send notification to admin"""
     if not ADMIN_CHAT_ID:
@@ -252,7 +366,7 @@ async def send_admin_notification(message, reply_markup=None):
     except Exception as e:
         print(f"NOTIFICATION ERROR: {e}", flush=True)
 
-# --- 5. QUEUE WORKER ---
+# --- QUEUE WORKER ---
 JOB_QUEUE = queue.Queue()
 JOBS = {} 
 WORKER_THREAD = None
@@ -330,13 +444,23 @@ def ensure_worker_alive():
 def home(): 
     """Health check"""
     ensure_worker_alive()
+    reset_daily_counters()
+    
+    account_status = []
+    for i, acc in enumerate(PIKPAK_ACCOUNTS):
+        if acc.get('email'):
+            account_status.append({
+                f"account_{i+1}": f"{acc['daily_used']}/5 used"
+            })
+    
     return jsonify({
         "status": "online",
-        "service": "Debrid-Link Bridge",
+        "service": "PikPak Bridge (4 Accounts)",
         "queue": JOB_QUEUE.qsize(),
         "jobs": len(JOBS),
         "sessions": len(MESSAGE_SESSIONS),
-        "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False
+        "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False,
+        "accounts": account_status
     })
 
 # --- SESSION ROUTES ---
@@ -442,6 +566,28 @@ def debug_sessions():
             } for k, v in MESSAGE_SESSIONS.items()}
         })
 
+@app.route('/debug/accounts', methods=['GET'])
+def debug_accounts():
+    """Debug: Show account usage"""
+    reset_daily_counters()
+    
+    account_info = []
+    for i, acc in enumerate(PIKPAK_ACCOUNTS):
+        if acc.get('email'):
+            account_info.append({
+                "account": i + 1,
+                "email": acc['email'],
+                "daily_used": acc['daily_used'],
+                "limit": 5,
+                "available": 5 - acc['daily_used'],
+                "has_token": bool(acc.get('access_token'))
+            })
+    
+    return jsonify({
+        "accounts": account_info,
+        "total_available": sum(5 - acc['daily_used'] for acc in PIKPAK_ACCOUNTS if acc.get('email'))
+    })
+
 # --- TELEGRAM UPLOAD ROUTES ---
 @app.route('/upload-telegram', methods=['POST'])
 def upload_telegram():
@@ -493,237 +639,295 @@ def detect_quality_api():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- DEBRID-LINK API ROUTES ---
+# --- PIKPAK API ROUTES ---
 
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
-    """Add magnet to Debrid-Link with retry"""
+    """Add magnet to PikPak with account rotation"""
     max_retries = 3
     retry_count = 0
-    last_error = None
     
     while retry_count < max_retries:
         try:
-            token = request.json.get('token')
             magnet = request.json.get('magnet')
             
-            print(f"DEBRID: Adding magnet (attempt {retry_count + 1}/{max_retries})", flush=True)
+            # Get available account
+            account, account_index = get_available_account()
             
+            if not account:
+                # All accounts exhausted
+                asyncio.run(send_admin_notification(
+                    f"⚠️ **All PikPak Accounts Exhausted**\n\n"
+                    f"All 4 accounts have reached their daily limit (5 torrents each).\n"
+                    f"Limits reset at midnight UTC.\n"
+                    f"Current time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                ))
+                return jsonify({
+                    "error": "All accounts exhausted",
+                    "message": "All 4 PikPak accounts have reached daily limit. Try after midnight UTC."
+                }), 429
+            
+            print(f"PIKPAK: Adding magnet with account {account_index+1}...", flush=True)
+            
+            headers = get_pikpak_headers(account)
+            
+            # Add offline download task
             resp = requests.post(
-                "https://debrid-link.com/api/v2/seedbox/add",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"url": magnet, "async": True},
+                "https://api-drive.mypikpak.com/drive/v1/files",
+                headers=headers,
+                json={
+                    "kind": "drive#file",
+                    "name": "",
+                    "upload_type": "UPLOAD_TYPE_URL",
+                    "url": {
+                        "url": magnet
+                    },
+                    "folder_type": "DOWNLOAD"
+                },
                 timeout=30
             )
             
             result = resp.json()
             
-            if result.get('success') == False:
-                raise Exception(result.get('error', 'Unknown Debrid-Link error'))
+            if 'error' in result:
+                error_code = result.get('error_code', 0)
+                
+                # Token expired
+                if error_code == 16:
+                    print(f"PIKPAK: Token expired, re-logging in...", flush=True)
+                    pikpak_login(account)
+                    raise Exception("Token expired, retry")
+                
+                raise Exception(f"PikPak error: {result.get('error_description', result.get('error', 'Unknown'))}")
             
-            # Extract torrent ID from response
-            torrent_data = result.get('value', {})
-            torrent_id = torrent_data.get('id')
+            task = result.get('task', {})
+            task_id = task.get('id')
+            file_id = result.get('file', {}).get('id')
             
-            print(f"DEBRID: ✅ Torrent added successfully (ID: {torrent_id})", flush=True)
+            if not task_id:
+                raise Exception("No task ID in response")
+            
+            # Increment usage
+            increment_account_usage(account_index)
+            
+            print(f"PIKPAK: ✅ Magnet added (Task ID: {task_id}, Account: {account_index+1})", flush=True)
             
             return jsonify({
                 "result": True,
-                "id": torrent_id,
-                "name": torrent_data.get('name', ''),
+                "id": file_id or task_id,
+                "task_id": task_id,
+                "account_used": account_index + 1,
                 "code": 200
             })
             
         except Exception as e:
             last_error = str(e)
             retry_count += 1
+            
             if retry_count < max_retries:
-                print(f"DEBRID: Retry {retry_count}/{max_retries} due to: {last_error}", flush=True)
+                print(f"PIKPAK: Retry {retry_count}/{max_retries} due to: {last_error}", flush=True)
                 time.sleep(10)
             else:
                 asyncio.run(send_admin_notification(
-                    f"⚠️ **Debrid-Link Add Failed**\n\n"
+                    f"⚠️ **PikPak Add Failed**\n\n"
                     f"Retries: {max_retries}/{max_retries}\n"
                     f"Error: {last_error}\n"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
+                    f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
                 ))
                 return jsonify({"error": last_error, "retries": max_retries}), 500
 
 @app.route('/list-files', methods=['POST'])
 def list_files():
-    """List Debrid-Link files with retry"""
+    """List PikPak files"""
     max_retries = 3
     retry_count = 0
-    last_error = None
     
     while retry_count < max_retries:
         try:
-            token = request.json.get('token')
             folder_id = request.json.get('folder_id', '0')
             
-            resp = requests.get(
-                "https://debrid-link.com/api/v2/seedbox/list",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30
-            )
+            # Get any account (for listing)
+            account, _ = get_available_account()
+            if not account:
+                account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
             
-            result = resp.json()
+            if not account:
+                return jsonify({"error": "No accounts configured"}), 500
             
-            if result.get('success') == False:
-                raise Exception(result.get('error', 'Failed to list files'))
+            headers = get_pikpak_headers(account)
             
-            torrents = result.get('value', [])
+            # List files
+            if folder_id == '0':
+                # List root (all files)
+                resp =requests.get(
+"https://api-drive.mypikpak.com/drive/v1/files",
+headers=headers,
+params={
+"thumbnail_size": "SIZE_LARGE",
+"limit": 100,
+"filters": json.dumps({"phase": {"eq": "PHASE_TYPE_COMPLETE"}})
+},
+timeout=30
+)
+else:
+# List specific folder
+resp = requests.get(
+"https://api-drive.mypikpak.com/drive/v1/files",
+headers=headers,
+params={
+"parent_id": folder_id,
+"thumbnail_size": "SIZE_LARGE",
+"limit": 100
+},
+timeout=30
+)
+        result = resp.json()
+        
+        if 'error' in result:
+            error_code = result.get('error_code', 0)
+            if error_code == 16:
+                pikpak_login(account)
+                raise Exception("Token expired, retry")
+            raise Exception(f"List error: {result.get('error', 'Unknown')}")
+        
+        files_data = result.get('files', [])
+        
+        if folder_id == '0':
+            # Return folders (completed downloads)
+            folders = [{
+                'id': f['id'],
+                'name': f['name']
+            } for f in files_data if f.get('kind') == 'drive#folder']
             
-            # Root level - return list of torrents
-            if folder_id == '0' or folder_id == 0:
-                if not torrents:
-                    if retry_count < max_retries - 1:
-                        raise Exception("No torrents found yet, retrying...")
-                    return jsonify({"folders": [], "files": []})
-                
-                folders = [{
-                    'id': str(t['id']),
-                    'name': t['name']
-                } for t in torrents]
-                
-                return jsonify({"folders": folders, "files": []})
-            
-            # Specific torrent - return its files
-            folder_id_str = str(folder_id)
-            torrent = next((t for t in torrents if str(t['id']) == folder_id_str), None)
-            
-            if not torrent:
-                raise Exception(f"Torrent {folder_id} not found")
-            
+            return jsonify({"folders": folders, "files": []})
+        else:
+            # Return files in folder
             files = [{
-                'folder_file_id': str(f['id']),
+                'folder_file_id': f['id'],
                 'name': f['name'],
-                'size': f['size']
-            } for f in torrent.get('files', [])]
+                'size': f.get('size', 0)
+            } for f in files_data if f.get('kind') == 'drive#file']
             
             return jsonify({"files": files, "folders": []})
-            
-        except Exception as e:
-            last_error = str(e)
-            retry_count += 1
-            if retry_count < max_retries:
-                print(f"DEBRID: List files retry {retry_count}/{max_retries}", flush=True)
-                time.sleep(10)
-            else:
-                return jsonify({"error": last_error, "retries": max_retries}), 500
-
+        
+    except Exception as e:
+        retry_count += 1
+        if retry_count < max_retries:
+            print(f"PIKPAK: List retry {retry_count}/{max_retries}", flush=True)
+            time.sleep(10)
+        else:
+            return jsonify({"error": str(e)}), 500
 @app.route('/get-link', methods=['POST'])
 def get_link():
-    """Get download link from Debrid-Link"""
-    try:
-        token = request.json.get('token')
-        file_id = request.json.get('file_id')
-        
-        print(f"DEBRID: Getting download link for file {file_id}", flush=True)
-        
-        # First, get list of all torrents to find which one contains this file
-        resp = requests.get(
-            "https://debrid-link.com/api/v2/seedbox/list",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30
-        )
-        
-        result = resp.json()
-        if result.get('success') == False:
-            raise Exception("Failed to list torrents")
-        
-        torrents = result.get('value', [])
-        
-        # Find the file in torrents
-        download_url = None
-        for torrent in torrents:
-            for file in torrent.get('files', []):
-                if str(file['id']) == str(file_id):
-                    download_url = file.get('downloadUrl')
-                    break
-            if download_url:
-                break
-        
-        if not download_url:
-            raise Exception(f"File {file_id} not found or download URL unavailable")
-        
-        print(f"DEBRID: ✅ Got download link", flush=True)
-        
-        return jsonify({"url": download_url})
-        
-    except Exception as e:
-        print(f"DEBRID ERROR: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
+"""Get download link from PikPak"""
+try:
+file_id = request.json.get('file_id')
+    # Get any account
+    account, _ = get_available_account()
+    if not account:
+        account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
+    
+    if not account:
+        return jsonify({"error": "No accounts configured"}), 500
+    
+    headers = get_pikpak_headers(account)
+    
+    print(f"PIKPAK: Getting download link for file {file_id}", flush=True)
+    
+    # Get file info
+    resp = requests.get(
+        f"https://api-drive.mypikpak.com/drive/v1/files/{file_id}",
+        headers=headers,
+        timeout=30
+    )
+    
+    result = resp.json()
+    
+    if 'error' in result:
+        raise Exception(f"Get link error: {result.get('error', 'Unknown')}")
+    
+    # Get web content link
+    web_content_link = result.get('web_content_link')
+    
+    if not web_content_link:
+        raise Exception("No download link available")
+    
+    print(f"PIKPAK: ✅ Got download link", flush=True)
+    
+    return jsonify({"url": web_content_link})
+    
+except Exception as e:
+    print(f"PIKPAK ERROR: {e}", flush=True)
+    return jsonify({"error": str(e)}), 500
 @app.route('/delete-folder', methods=['POST'])
 def delete_folder():
-    """Delete torrent from Debrid-Link"""
-    try:
-        folder_id = str(request.json.get('folder_id'))
-        token = request.json.get('token')
-        
-        if not folder_id or folder_id == 'null' or folder_id == 'None':
-            print(f"DEBRID ERROR: Invalid folder_id: {folder_id}", flush=True)
-            return jsonify({"error": "Invalid folder_id"}), 400
-        
-        print(f"DEBRID: Attempting to delete torrent \"{folder_id}\"", flush=True)
-        
-        resp = requests.delete(
-            f"https://debrid-link.com/api/v2/seedbox/{folder_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30
-        )
-        
-        result = resp.json()
-        print(f"DEBRID: Delete response: {result}", flush=True)
-        
-        # Verify deletion
-        time.sleep(2)  # Wait a moment
-        
-        verify_resp = requests.get(
-            "https://debrid-link.com/api/v2/seedbox/list",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30
-        )
-        
-        verify_result = verify_resp.json()
-        if verify_result.get('success'):
-            remaining_ids = [str(t['id']) for t in verify_result.get('value', [])]
-            
-            if folder_id not in remaining_ids:
-                print(f"DEBRID: ✅ Torrent {folder_id} successfully deleted!", flush=True)
-            else:
-                print(f"DEBRID WARNING: Torrent {folder_id} still exists after delete!", flush=True)
-        
+"""Delete file/folder from PikPak"""
+try:
+folder_id = str(request.json.get('folder_id'))
+    if not folder_id or folder_id == 'null' or folder_id == 'None':
+        return jsonify({"error": "Invalid folder_id"}), 400
+    
+    # Get any account
+    account, _ = get_available_account()
+    if not account:
+        account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
+    
+    if not account:
+        return jsonify({"error": "No accounts configured"}), 500
+    
+    headers = get_pikpak_headers(account)
+    
+    print(f"PIKPAK: Attempting to delete file/folder \"{folder_id}\"", flush=True)
+    
+    # Delete file
+    resp = requests.delete(
+        f"https://api-drive.mypikpak.com/drive/v1/files/{folder_id}",
+        headers=headers,
+        timeout=30
+    )
+    
+    # PikPak returns 204 No Content on successful delete
+    if resp.status_code == 204:
+        print(f"PIKPAK: ✅ File/folder {folder_id} successfully deleted!", flush=True)
         return jsonify({"result": True, "code": 200})
-        
-    except Exception as e:
-        print(f"DEBRID ERROR: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-# --- CLEANUP EXPIRED SESSIONS ---
+    
+    result = resp.json() if resp.text else {}
+    
+    if 'error' in result:
+        print(f"PIKPAK: Delete error: {result}", flush=True)
+    
+    print(f"PIKPAK: Delete response: {result}", flush=True)
+    
+    return jsonify({"result": True, "code": 200})
+    
+except Exception as e:
+    print(f"PIKPAK ERROR: {e}", flush=True)
+    return jsonify({"error": str(e)}), 500
+--- CLEANUP EXPIRED SESSIONS ---
 def cleanup_sessions():
-    """Remove expired sessions"""
-    while True:
-        try:
-            time.sleep(60)
-            current_time = time.time()
-            
-            with SESSION_LOCK:
-                expired = [k for k, v in MESSAGE_SESSIONS.items() if current_time > v['timeout']]
-                for session_id in expired:
-                    del MESSAGE_SESSIONS[session_id]
-                    print(f"SESSION: Cleaned up expired \"{session_id}\"", flush=True)
-        except Exception as e:
-            print(f"CLEANUP ERROR: {e}", flush=True)
-
-# Start cleanup thread
+"""Remove expired sessions"""
+while True:
+try:
+time.sleep(60)
+current_time = time.time()
+        with SESSION_LOCK:
+            expired = [k for k, v in MESSAGE_SESSIONS.items() if current_time > v['timeout']]
+            for session_id in expired:
+                del MESSAGE_SESSIONS[session_id]
+                print(f"SESSION: Cleaned up expired \"{session_id}\"", flush=True)
+    except Exception as e:
+        print(f"CLEANUP ERROR: {e}", flush=True)
+Start cleanup thread
 cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
 cleanup_thread.start()
+if name == 'main':
+print("=" * 60, flush=True)
+print("🚀 PikPak Telegram Bridge Starting (4-Account Rotation)", flush=True)
+print("=" * 60, flush=True)
+# Initialize accounts
+for i, acc in enumerate(PIKPAK_ACCOUNTS):
+    if acc.get('email'):
+        print(f"Account {i+1}: {acc['email']}", flush=True)
 
-if __name__ == '__main__':
-    print("=" * 50, flush=True)
-    print("🚀 Debrid-Link Telegram Bridge Starting", flush=True)
-    print("=" * 50, flush=True)
-    ensure_worker_alive()
-    app.run(host='0.0.0.0', port=10000)
+ensure_worker_alive()
+app.run(host='0.0.0.0', port=10000)
