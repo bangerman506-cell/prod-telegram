@@ -455,7 +455,7 @@ def home():
     
     return jsonify({
         "status": "online",
-        "service": "PikPak Bridge (4 Accounts)",
+        "service": "PikPak Bridge (4-Account Rotation)",
         "queue": JOB_QUEUE.qsize(),
         "jobs": len(JOBS),
         "sessions": len(MESSAGE_SESSIONS),
@@ -759,152 +759,152 @@ def list_files():
             # List files
             if folder_id == '0':
                 # List root (all files)
-                resp =requests.get(
-"https://api-drive.mypikpak.com/drive/v1/files",
-headers=headers,
-params={
-"thumbnail_size": "SIZE_LARGE",
-"limit": 100,
-"filters": json.dumps({"phase": {"eq": "PHASE_TYPE_COMPLETE"}})
-},
-timeout=30
-)
-else:
-# List specific folder
-resp = requests.get(
-"https://api-drive.mypikpak.com/drive/v1/files",
-headers=headers,
-params={
-"parent_id": folder_id,
-"thumbnail_size": "SIZE_LARGE",
-"limit": 100
-},
-timeout=30
-)
+                resp = requests.get(
+                    "https://api-drive.mypikpak.com/drive/v1/files",
+                    headers=headers,
+                    params={
+                        "thumbnail_size": "SIZE_LARGE",
+                        "limit": 100,
+                        "filters": json.dumps({"phase": {"eq": "PHASE_TYPE_COMPLETE"}})
+                    },
+                    timeout=30
+                )
+            else:
+                # List specific folder
+                resp = requests.get(
+                    "https://api-drive.mypikpak.com/drive/v1/files",
+                    headers=headers,
+                    params={
+                        "parent_id": folder_id,
+                        "thumbnail_size": "SIZE_LARGE",
+                        "limit": 100
+                    },
+                    timeout=30
+                )
+            result = resp.json()
+            
+            if 'error' in result:
+                error_code = result.get('error_code', 0)
+                if error_code == 16:
+                    pikpak_login(account)
+                    raise Exception("Token expired, retry")
+                raise Exception(f"List error: {result.get('error', 'Unknown')}")
+            
+            files_data = result.get('files', [])
+            
+            if folder_id == '0':
+                # Return folders (completed downloads)
+                folders = [{
+                    'id': f['id'],
+                    'name': f['name']
+                } for f in files_data if f.get('kind') == 'drive#folder']
+                
+                return jsonify({"folders": folders, "files": []})
+            else:
+                # Return files in folder
+                files = [{
+                    'folder_file_id': f['id'],
+                    'name': f['name'],
+                    'size': f.get('size', 0)
+                } for f in files_data if f.get('kind') == 'drive#file']
+                
+                return jsonify({"files": files, "folders": []})
+            
+        except Exception as e:
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"PIKPAK: List retry {retry_count}/{max_retries}", flush=True)
+                time.sleep(10)
+            else:
+                return jsonify({"error": str(e)}), 500
+
+@app.route('/get-link', methods=['POST'])
+def get_link():
+    """Get download link from PikPak"""
+    try:
+        file_id = request.json.get('file_id')
+        # Get any account
+        account, _ = get_available_account()
+        if not account:
+            account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
+        
+        if not account:
+            return jsonify({"error": "No accounts configured"}), 500
+        
+        headers = = = get = get_pikpak_headers(account)
+        
+        print(f"PIKPAK: Getting download link for file {file_id}", flush=True)
+        
+        # Get file info
+        resp = requests.get(
+            f"https://api-drive.mypikpak.com/drive/v1/files/{file_id}",
+            headers=headers,
+            timeout=30
+        )
+        
         result = resp.json()
         
         if 'error' in result:
-            error_code = result.get('error_code', 0)
-            if error_code == 16:
-                pikpak_login(account)
-                raise Exception("Token expired, retry")
-            raise Exception(f"List error: {result.get('error', 'Unknown')}")
+            raise Exception(f"Get link error: {result.get('error', 'Unknown')}")
         
-        files_data = result.get('files', [])
+        # Get web content link
+        web_content_link = result.get('web_content_link')
         
-        if folder_id == '0':
-            # Return folders (completed downloads)
-            folders = [{
-                'id': f['id'],
-                'name': f['name']
-            } for f in files_data if f.get('kind') == 'drive#folder']
-            
-            return jsonify({"folders": folders, "files": []})
-        else:
-            # Return files in folder
-            files = [{
-                'folder_file_id': f['id'],
-                'name': f['name'],
-                'size': f.get('size', 0)
-            } for f in files_data if f.get('kind') == 'drive#file']
-            
-            return jsonify({"files": files, "folders": []})
+        if not web_content_link:
+            raise Exception("No download link available")
+        
+        print(f"PIKPAK: ✅ Got download link", flush=True)
+        
+        return jsonify({"url": web_content_link})
         
     except Exception as e:
-        retry_count += 1
-        if retry_count < max_retries:
-            print(f"PIKPAK: List retry {retry_count}/{max_retries}", flush=True)
-            time.sleep(10)
-        else:
-            return jsonify({"error": str(e)}), 500
-@app.route('/get-link', methods=['POST'])
-def get_link():
-"""Get download link from PikPak"""
-try:
-file_id = request.json.get('file_id')
-    # Get any account
-    account, _ = get_available_account()
-    if not account:
-        account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
-    
-    if not account:
-        return jsonify({"error": "No accounts configured"}), 500
-    
-    headers = get_pikpak_headers(account)
-    
-    print(f"PIKPAK: Getting download link for file {file_id}", flush=True)
-    
-    # Get file info
-    resp = requests.get(
-        f"https://api-drive.mypikpak.com/drive/v1/files/{file_id}",
-        headers=headers,
-        timeout=30
-    )
-    
-    result = resp.json()
-    
-    if 'error' in result:
-        raise Exception(f"Get link error: {result.get('error', 'Unknown')}")
-    
-    # Get web content link
-    web_content_link = result.get('web_content_link')
-    
-    if not web_content_link:
-        raise Exception("No download link available")
-    
-    print(f"PIKPAK: ✅ Got download link", flush=True)
-    
-    return jsonify({"url": web_content_link})
-    
-except Exception as e:
-    print(f"PIKPAK ERROR: {e}", flush=True)
-    return jsonify({"error": str(e)}), 500
+        print(f"PIKPAK ERROR: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/delete-folder', methods=['POST'])
 def delete_folder():
-"""Delete file/folder from PikPak"""
-try:
-folder_id = str(request.json.get('folder_id'))
-    if not folder_id or folder_id == 'null' or folder_id == 'None':
-        return jsonify({"error": "Invalid folder_id"}), 400
-    
-    # Get any account
-    account, _ = get_available_account()
-    if not account:
-        account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
-    
-    if not account:
-        return jsonify({"error": "No accounts configured"}), 500
-    
-    headers = get_pikpak_headers(account)
-    
-    print(f"PIKPAK: Attempting to delete file/folder \"{folder_id}\"", flush=True)
-    
-    # Delete file
-    resp = requests.delete(
-        f"https://api-drive.mypikpak.com/drive/v1/files/{folder_id}",
-        headers=headers,
-        timeout=30
-    )
-    
-    # PikPak returns 204 No Content on successful delete
-    if resp.status_code == 204:
-        print(f"PIKPAK: ✅ File/folder {folder_id} successfully deleted!", flush=True)
+    """Delete file/folder from PikPak"""
+    try:
+        folder_id = str(request.json.get('folder_id'))
+        if not folder_id or folder_id == 'null' or folder_id == 'None':
+            return jsonify({"error": "Invalid folder_id"}), 400
+        
+        # Get any account
+        account, _ = get_available_account()
+        if not account:
+            account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
+        
+        if not account:
+            return jsonify({"error": "No accounts configured"}), 500
+        
+        headers = get_pikpak_headers(account)
+        
+        print(f"PIKPAK: Attempting to delete file/folder \"{folder_id}\"", flush=True)
+        
+        # Delete file
+        resp = requests.delete(
+            f"https://api-drive.mypikpak.com/drive/v1/files/{folder_id}",
+            headers=headers,
+            timeout=30
+        )
+        
+        # PikPak returns 204 No Content on successful delete
+        if resp.status_code == 204:
+            print(f"PIKPAK: ✅ File/folder {folder_id} successfully deleted!", flush=True)
+            return jsonify({"result": True, "code": 200})
+        
+        result = resp.json() if resp.text else {}
+        
+        if 'error' in result:
+            print(f"PIKPAK: Delete error: {result}", flush=True)
+        
+        print(f"PIKPAK: Delete response: {result}", flush=True)
+        
         return jsonify({"result": True, "code": 200})
-    
-    result = resp.json() if resp.text else {}
-    
-    if 'error' in result:
-        print(f"PIKPAK: Delete error: {result}", flush=True)
-    
-    print(f"PIKPAK: Delete response: {result}", flush=True)
-    
-    return jsonify({"result": True, "code": 200})
-    
-# ... [previous code] ...
-
-except Exception as e:
-    print(f"PIKPAK ERROR: {e}", flush=True)
-    return jsonify({"error": str(e)}), 500
+        
+    except Exception as e:
+        print(f"PIKPAK ERROR: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 # --- CLEANUP EXPIRED SESSIONS ---
 def cleanup_sessions():
