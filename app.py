@@ -7,7 +7,8 @@ import uuid
 import time
 import re
 import json
-from datetime import datetime, timedelta, timezone
+import hashlib
+from datetime import datetime, timedelta
 from io import IOBase
 from flask import Flask, request, jsonify
 from pyrogram import Client
@@ -30,133 +31,600 @@ if API_ID:
 
 HEADERS_STREAM = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "*/*"
+    "Content-Type": "application/x-www-form-urlencoded"
 }
 
 # Message collection storage
 MESSAGE_SESSIONS = {}
 SESSION_LOCK = threading.Lock()
 
-# --- PIKPAK ACCOUNT MANAGEMENT ---
-PIKPAK_ACCOUNTS = [
-    {
-        "email": os.environ.get("PIKPAK_EMAIL_1"),
-        "password": os.environ.get("PIKPAK_PASSWORD_1"),
-        "access_token": None,
-        "refresh_token": None,
-        "daily_used": 0,
-        "last_reset": None
-    },
-    {
-        "email": os.environ.get("PIKPAK_EMAIL_2"),
-        "password": os.environ.get("PIKPAK_PASSWORD_2"),
-        "access_token": None,
-        "refresh_token": None,
-        "daily_used": 0,
-        "last_reset": None
-    },
-    {
-        "email": os.environ.get("PIKPAK_EMAIL_3"),
-        "password": os.environ.get("PIKPAK_PASSWORD_3"),
-        "access_token": None,
-        "refresh_token": None,
-        "daily_used": 0,
-        "last_reset": None
-    },
-    {
-        "email": os.environ.get("PIKPAK_EMAIL_4"),
-        "password": os.environ.get("PIKPAK_PASSWORD_4"),
-        "access_token": None,
-        "refresh_token": None,
-        "daily_used": 0,
-        "last_reset": None
-    }
+# ============================================================
+# PIKPAK CONFIGURATION
+# ============================================================
+
+PIKPAK_CLIENT_ID = "YUMx5nI8ZU8Ap8pm"
+PIKPAK_CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coyg"
+PIKPAK_CLIENT_VERSION = "2.0.0"
+PIKPAK_PACKAGE_NAME = "mypikpak.com"
+
+PIKPAK_API_USER = "https://user.mypikpak.com"
+PIKPAK_API_DRIVE = "https://api-drive.mypikpak.com"
+
+# 15 Secret Salts for captcha_sign generation
+PIKPAK_SALTS = [
+    "C9qPpZLN8ucRTaTiUMWYS9cQvWOE",
+    "+r6CQVxjzJV6LCV",
+    "F",
+    "pFJRC",
+    "9WXYIDGrwTCz2OiVlgZa90qpECPD6olt",
+    "/750aCr4lm/Sly/c",
+    "RB+DT/gZCrbV",
+    "",  # Empty salt #8
+    "CyLsf7hdkIRxRm215hl",
+    "7xHvLi2tOYP0Y92b",
+    "ZGTXXxu8E/MIWaEDB+Sm/",
+    "1UI3",
+    "E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO",
+    "ihtqpG6FMt65+Xk+tWUH2",
+    "NhXXU9rg4XXdzo7u5o"
 ]
 
-ACCOUNT_LOCK = threading.Lock()
+# Load PikPak accounts from environment
+def load_pikpak_accounts():
+    accounts = []
+    for i in range(1, 5):  # Accounts 1-4
+        email = os.environ.get(f"PIKPAK_{i}_EMAIL")
+        if email:
+            accounts.append({
+                "id": i,
+                "email": email,
+                "password": os.environ.get(f"PIKPAK_{i}_PASSWORD", ""),
+                "device_id": os.environ.get(f"PIKPAK_{i}_DEVICE_ID", ""),
+                "my_pack_id": os.environ.get(f"PIKPAK_{i}_MY_PACK_ID", ""),
+                "access_token": None,
+                "refresh_token": None,
+                "user_id": None,
+                "token_expires_at": 0,
+                "downloads_today": 0,
+                "last_download_date": None
+            })
+    return accounts
 
-def reset_daily_counters():
-    """Reset daily usage at midnight UTC"""
-    now = datetime.now(timezone.utc)
-    
-    with ACCOUNT_LOCK:
-        for account in PIKPAK_ACCOUNTS:
-            if not account.get('email'):
-                continue
-                
-            last_reset = account.get('last_reset')
-            
-            # Reset if never reset or different day
-            if not last_reset or last_reset.date() < now.date():
-                account['daily_used'] = 0
-                account['last_reset'] = now
-                print(f"PIKPAK: Reset counter for {account['email']}", flush=True)
+PIKPAK_ACCOUNTS = load_pikpak_accounts()
+PIKPAK_TOKENS_FILE = "/tmp/pikpak_tokens.json"
+PIKPAK_LOCK = threading.Lock()
 
-def get_available_account():
-    """Get account with available daily quota"""
-    reset_daily_counters()
+# ============================================================
+# PIKPAK TOKEN STORAGE
+# ============================================================
+
+def load_pikpak_tokens():
+    """Load tokens from file"""
+    try:
+        with open(PIKPAK_TOKENS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_pikpak_tokens(tokens):
+    """Save tokens to file"""
+    try:
+        with open(PIKPAK_TOKENS_FILE, 'w') as f:
+            json.dump(tokens, f)
+    except Exception as e:
+        print(f"PIKPAK: Failed to save tokens: {e}", flush=True)
+
+def get_account_tokens(account_id):
+    """Get tokens for specific account"""
+    tokens = load_pikpak_tokens()
+    return tokens.get(f"account_{account_id}", {})
+
+def set_account_tokens(account_id, token_data):
+    """Save tokens for specific account"""
+    tokens = load_pikpak_tokens()
+    tokens[f"account_{account_id}"] = token_data
+    save_pikpak_tokens(tokens)
+
+# ============================================================
+# PIKPAK CAPTCHA SIGN GENERATION
+# ============================================================
+
+def generate_captcha_sign(device_id):
+    """
+    Generate PikPak captcha_sign using MD5 + 15 salts
+    Returns: (captcha_sign, timestamp)
+    """
+    timestamp = str(int(time.time() * 1000))
     
-    with ACCOUNT_LOCK:
-        for i, account in enumerate(PIKPAK_ACCOUNTS):
-            if not account.get('email'):
-                continue
-            
-            if account['daily_used'] < 5:
-                print(f"PIKPAK: Using account {i+1} ({account['email']}) - Used: {account['daily_used']}/5", flush=True)
-                return account, i
+    # Build base string
+    base_string = (
+        PIKPAK_CLIENT_ID + 
+        PIKPAK_CLIENT_VERSION + 
+        PIKPAK_PACKAGE_NAME + 
+        device_id + 
+        timestamp
+    )
+    
+    # Chain hash through 15 salts
+    result = base_string
+    for salt in PIKPAK_SALTS:
+        result = hashlib.md5((result + salt).encode()).hexdigest()
+    
+    captcha_sign = "1." + result
+    
+    return captcha_sign, timestamp
+
+# ============================================================
+# PIKPAK API HELPERS
+# ============================================================
+
+def get_pikpak_captcha(action, device_id, user_id=None, captcha_sign=None, timestamp=None, username=None):
+    """
+    Get captcha token for PikPak API operation
+    
+    action: "POST:/v1/auth/signin", "GET:/drive/v1/files", etc.
+    username: Required only for login action
+    """
+    url = f"{PIKPAK_API_USER}/v1/shield/captcha/init"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "x-device-id": device_id
+    }
+    
+    # Generate captcha_sign if not provided
+    if not captcha_sign or not timestamp:
+        captcha_sign, timestamp = generate_captcha_sign(device_id)
+    
+    # Build meta based on action type
+    if "signin" in action:
+        # Login requires username in meta
+        meta = {
+            "username": username
+        }
+    else:
+        # API calls require full meta
+        meta = {
+            "captcha_sign": captcha_sign,
+            "client_version": PIKPAK_CLIENT_VERSION,
+            "package_name": PIKPAK_PACKAGE_NAME,
+            "timestamp": timestamp,
+            "user_id": user_id or ""
+        }
+    
+    body = {
+        "client_id": PIKPAK_CLIENT_ID,
+        "action": action,
+        "device_id": device_id,
+        "meta": meta
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=30)
+        data = response.json()
         
-        print(f"PIKPAK ERROR: All accounts exhausted for today!", flush=True)
-        return None, None
-
-def increment_account_usage(account_index):
-    """Increment usage counter for account"""
-    with ACCOUNT_LOCK:
-        if 0 <= account_index < len(PIKPAK_ACCOUNTS):
-            PIKPAK_ACCOUNTS[account_index]['daily_used'] += 1
-            print(f"PIKPAK: Account {account_index+1} now at {PIKPAK_ACCOUNTS[account_index]['daily_used']}/5", flush=True)
+        if "captcha_token" in data:
+            return data["captcha_token"]
+        else:
+            print(f"PIKPAK: Captcha error: {data}", flush=True)
+            raise Exception(f"Captcha failed: {data.get('error', 'Unknown')}")
+    
+    except Exception as e:
+        print(f"PIKPAK: Captcha request failed: {e}", flush=True)
+        raise
 
 def pikpak_login(account):
-    """Login to PikPak and get access token"""
-    try:
-        print(f"PIKPAK: Logging in as {account['email']}...", flush=True)
-        
-        resp = requests.post(
-            "https://user.mypikpak.com/v1/auth/signin",
-            json={
-                "email": account['email'],
-                "password": account['password']
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        data = resp.json()
-        
-        if 'access_token' not in data:
-            raise Exception(f"Login failed: {data.get('error_description', 'Unknown error')}")
-        
-        account['access_token'] = data['access_token']
-        account['refresh_token'] = data.get('refresh_token')
-        
-        print(f"PIKPAK: ✅ Login successful for {account['email']}", flush=True)
-        return account['access_token']
-        
-    except Exception as e:
-        print(f"PIKPAK LOGIN ERROR: {e}", flush=True)
-        return None
-
-def get_pikpak_headers(account):
-    """Get headers with valid access token"""
-    if not account.get('access_token'):
-        pikpak_login(account)
+    """
+    Login to PikPak account
+    Returns: token data dict
+    """
+    print(f"PIKPAK: Logging in account {account['id']} ({account['email']})", flush=True)
     
-    return {
-        "Authorization": f"Bearer {account['access_token']}",
+    device_id = account["device_id"]
+    email = account["email"]
+    password = account["password"]
+    
+    # Step 1: Get captcha for login
+    captcha_token = get_pikpak_captcha(
+        action="POST:/v1/auth/signin",
+        device_id=device_id,
+        username=email
+    )
+    
+    # Step 2: Login
+    url = f"{PIKPAK_API_USER}/v1/auth/signin"
+    
+    headers = {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
     }
+    
+    body = {
+        "client_id": PIKPAK_CLIENT_ID,
+        "client_secret": PIKPAK_CLIENT_SECRET,
+        "username": email,
+        "password": password
+    }
+    
+    response = requests.post(url, headers=headers, json=body, timeout=30)
+    data = response.json()
+    
+    if "access_token" in data:
+        token_data = {
+            "access_token": data["access_token"],
+            "refresh_token": data["refresh_token"],
+            "user_id": data["sub"],
+            "expires_at": time.time() + data.get("expires_in", 7200) - 300  # 5 min buffer
+        }
+        
+        # Save tokens
+        set_account_tokens(account["id"], token_data)
+        
+        print(f"PIKPAK: ✅ Login successful for account {account['id']}", flush=True)
+        return token_data
+    else:
+        print(f"PIKPAK: ❌ Login failed: {data}", flush=True)
+        raise Exception(f"Login failed: {data.get('error', 'Unknown')}")
 
-# --- SMART STREAMER ---
+def refresh_pikpak_token(account):
+    """
+    Refresh expired access_token
+    """
+    print(f"PIKPAK: Refreshing token for account {account['id']}", flush=True)
+    
+    device_id = account["device_id"]
+    tokens = get_account_tokens(account["id"])
+    refresh_token = tokens.get("refresh_token")
+    user_id = tokens.get("user_id")
+    
+    if not refresh_token:
+        print(f"PIKPAK: No refresh token, doing full login", flush=True)
+        return pikpak_login(account)
+    
+    # Get captcha for token refresh
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    captcha_token = get_pikpak_captcha(
+        action="POST:/v1/auth/token",
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
+    
+    url = f"{PIKPAK_API_USER}/v1/auth/token"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
+    }
+    
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": PIKPAK_CLIENT_ID
+    }
+    
+    response = requests.post(url, headers=headers, json=body, timeout=30)
+    data = response.json()
+    
+    if "access_token" in data:
+        token_data = {
+            "access_token": data["access_token"],
+            "refresh_token": data.get("refresh_token", refresh_token),
+            "user_id": user_id,
+            "expires_at": time.time() + data.get("expires_in", 7200) - 300
+        }
+        
+        set_account_tokens(account["id"], token_data)
+        
+        print(f"PIKPAK: ✅ Token refreshed for account {account['id']}", flush=True)
+        return token_data
+    else:
+        print(f"PIKPAK: ❌ Refresh failed, doing full login: {data}", flush=True)
+        return pikpak_login(account)
+
+def ensure_logged_in(account):
+    """
+    Ensure account has valid access_token
+    Login or refresh if needed
+    Returns: token data dict
+    """
+    tokens = get_account_tokens(account["id"])
+    
+    if not tokens.get("access_token"):
+        print(f"PIKPAK: No token for account {account['id']}, logging in", flush=True)
+        return pikpak_login(account)
+    
+    if time.time() >= tokens.get("expires_at", 0):
+        print(f"PIKPAK: Token expired for account {account['id']}, refreshing", flush=True)
+        return refresh_pikpak_token(account)
+    
+    return tokens
+
+def select_available_account():
+    """
+    Select PikPak account with capacity
+    Implements rotation and daily limit (5/day)
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    usage = load_pikpak_tokens().get("daily_usage", {})
+    
+    for account in PIKPAK_ACCOUNTS:
+        account_key = f"account_{account['id']}"
+        account_usage = usage.get(account_key, {})
+        
+        # Reset if new day
+        if account_usage.get("date") != today:
+            account_usage = {"date": today, "count": 0}
+        
+        # Check limit (5 per day)
+        if account_usage.get("count", 0) < 5:
+            print(f"PIKPAK: Selected account {account['id']} ({account_usage.get('count', 0)}/5 today)", flush=True)
+            return account
+    
+    raise Exception("All PikPak accounts exhausted for today (20/20 downloads used)")
+
+def increment_account_usage(account_id):
+    """Increment daily download counter for account"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    tokens = load_pikpak_tokens()
+    
+    if "daily_usage" not in tokens:
+        tokens["daily_usage"] = {}
+    
+    account_key = f"account_{account_id}"
+    if tokens["daily_usage"].get(account_key, {}).get("date") != today:
+        tokens["daily_usage"][account_key] = {"date": today, "count": 0}
+    
+    tokens["daily_usage"][account_key]["count"] += 1
+    save_pikpak_tokens(tokens)
+    
+    print(f"PIKPAK: Account {account_id} usage: {tokens['daily_usage'][account_key]['count']}/5", flush=True)
+
+# ============================================================
+# PIKPAK DRIVE OPERATIONS
+# ============================================================
+
+def pikpak_add_magnet(magnet_link, account, tokens):
+    """
+    Add magnet link to PikPak
+    Returns: task info with file_id (folder)
+    """
+    print(f"PIKPAK: Adding magnet to account {account['id']}", flush=True)
+    
+    device_id = account["device_id"]
+    user_id = tokens["user_id"]
+    access_token = tokens["access_token"]
+    
+    # Get captcha for add magnet
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    captcha_token = get_pikpak_captcha(
+        action="POST:/drive/v1/files",
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
+    
+    url = f"{PIKPAK_API_DRIVE}/drive/v1/files"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
+    }
+    
+    body = {
+        "kind": "drive#file",
+        "name": "",
+        "upload_type": "UPLOAD_TYPE_URL",
+        "url": {
+            "url": magnet_link
+        },
+        "folder_type": "DOWNLOAD"
+    }
+    
+    response = requests.post(url, headers=headers, json=body, timeout=30)
+    data = response.json()
+    
+    if "task" in data:
+        print(f"PIKPAK: ✅ Magnet added: {data['task'].get('file_name', 'Unknown')}", flush=True)
+        return data["task"]
+    else:
+        print(f"PIKPAK: ❌ Add magnet failed: {data}", flush=True)
+        raise Exception(f"Add magnet failed: {data.get('error', 'Unknown')}")
+
+def pikpak_poll_download(file_id, account, tokens, timeout=120):
+    """
+    Poll until download completes
+    Returns: True when PHASE_TYPE_COMPLETE
+    """
+    print(f"PIKPAK: Polling download status for {file_id}", flush=True)
+    
+    device_id = account["device_id"]
+    user_id = tokens["user_id"]
+    access_token = tokens["access_token"]
+    
+    start_time = time.time()
+    poll_interval = 5  # seconds
+    
+    while time.time() - start_time < timeout:
+        try:
+            # Get fresh captcha
+            captcha_sign, timestamp = generate_captcha_sign(device_id)
+            captcha_token = get_pikpak_captcha(
+                action="GET:/drive/v1/files/{id}",
+                device_id=device_id,
+                user_id=user_id,
+                captcha_sign=captcha_sign,
+                timestamp=timestamp
+            )
+            
+            url = f"{PIKPAK_API_DRIVE}/drive/v1/files/{file_id}"
+            
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "x-device-id": device_id,
+                "x-captcha-token": captcha_token
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            data = response.json()
+            
+            phase = data.get("phase", "")
+            progress = data.get("progress", 0)
+            
+            print(f"PIKPAK: Status: {phase} ({progress}%)", flush=True)
+            
+            if phase == "PHASE_TYPE_COMPLETE":
+                print(f"PIKPAK: ✅ Download complete!", flush=True)
+                return True
+            elif phase == "PHASE_TYPE_ERROR":
+                raise Exception(f"Download failed: {data.get('message', 'Unknown error')}")
+            
+            time.sleep(poll_interval)
+            
+        except Exception as e:
+            if "Download failed" in str(e):
+                raise
+            print(f"PIKPAK: Poll error (retrying): {e}", flush=True)
+            time.sleep(poll_interval)
+    
+    raise Exception(f"Download timeout after {timeout} seconds")
+
+def pikpak_list_files(parent_id, account, tokens):
+    """
+    List files in folder
+    Returns: list of files
+    """
+    device_id = account["device_id"]
+    user_id = tokens["user_id"]
+    access_token = tokens["access_token"]
+    
+    # Get fresh captcha
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    captcha_token = get_pikpak_captcha(
+        action="GET:/drive/v1/files",
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
+    
+    url = f"{PIKPAK_API_DRIVE}/drive/v1/files"
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
+    }
+    
+    params = {
+        "parent_id": parent_id,
+        "limit": 100
+    }
+    
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    data = response.json()
+    
+    return data.get("files", [])
+
+def find_video_file(files):
+    """
+    Find video file from list
+    Returns: video file dict or None
+    """
+    for file in files:
+        if (file.get("file_category") == "VIDEO" or
+            file.get("mime_type", "").startswith("video/") or
+            file.get("file_extension") in [".mp4", ".mkv", ".avi", ".mov", ".wmv"]):
+            return file
+    return None
+
+def pikpak_get_download_link(file_id, account, tokens):
+    """
+    Get download link for file
+    Returns: download URL
+    """
+    device_id = account["device_id"]
+    user_id = tokens["user_id"]
+    access_token = tokens["access_token"]
+    
+    # Get fresh captcha
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    captcha_token = get_pikpak_captcha(
+        action="GET:/drive/v1/files/{id}",
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
+    
+    url = f"{PIKPAK_API_DRIVE}/drive/v1/files/{file_id}"
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
+    }
+    
+    response = requests.get(url, headers=headers, timeout=30)
+    data = response.json()
+    
+    download_url = data.get("web_content_link", "")
+    
+    if download_url:
+        return download_url
+    else:
+        raise Exception(f"No download link in response: {data}")
+
+def pikpak_delete_file(file_id, account, tokens):
+    """
+    Delete file/folder from PikPak
+    Returns: True on success
+    """
+    print(f"PIKPAK: Deleting file {file_id}", flush=True)
+    
+    device_id = account["device_id"]
+    user_id = tokens["user_id"]
+    access_token = tokens["access_token"]
+    
+    # Get fresh captcha
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    captcha_token = get_pikpak_captcha(
+        action="POST:/drive/v1/files:batchTrash",
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
+    
+    url = f"{PIKPAK_API_DRIVE}/drive/v1/files:batchTrash"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}",
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
+    }
+    
+    body = {
+        "ids": [file_id]
+    }
+    
+    response = requests.post(url, headers=headers, json=body, timeout=30)
+    data = response.json()
+    
+    print(f"PIKPAK: ✅ Delete response: {data}", flush=True)
+    return True
+
+# ============================================================
+# SMART STREAMER (unchanged)
+# ============================================================
+
 class SmartStream(IOBase):
     def __init__(self, url, name):
         super().__init__()
@@ -207,7 +675,10 @@ class SmartStream(IOBase):
     def fileno(self): 
         return None
 
-# --- METADATA EXTRACTION ---
+# ============================================================
+# METADATA EXTRACTION (unchanged)
+# ============================================================
+
 def extract_metadata_from_magnet(magnet_link):
     """Extract metadata from magnet name"""
     try:
@@ -264,7 +735,10 @@ def detect_quality_from_size(size_bytes):
     else:
         return None
 
-# --- ASYNC UPLOAD LOGIC ---
+# ============================================================
+# ASYNC UPLOAD LOGIC (unchanged)
+# ============================================================
+
 async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=0):
     """Upload video with retry"""
     
@@ -282,14 +756,14 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                 api_hash=API_HASH, 
                 bot_token=BOT_TOKEN, 
                 workdir="/tmp"
-            ) as app:
+            ) as tg_app:
                 print(f"WORKER: Bot connected! (Attempt {retry_count + 1}/{max_retries})", flush=True)
                 
                 final_chat_id = None
                 chat_str = str(chat_target).strip()
                 
                 if chat_str.startswith("@"):
-                    chat = await app.get_chat(chat_str)
+                    chat = await tg_app.get_chat(chat_str)
                     final_chat_id = chat.id
                     print(f"WORKER: ✅ Resolved to ID: {final_chat_id}", flush=True)
                 elif chat_str.lstrip("-").isdigit():
@@ -299,11 +773,11 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                 
                 with SmartStream(file_url, filename) as stream:
                     if stream.total_size == 0:
-                        raise Exception("File size is 0. Download link expired.")
+                        raise Exception("File size is 0. Link expired or invalid.")
                     
                     print(f"WORKER: Uploading {filename} ({stream.total_size/1024/1024:.1f}MB)...", flush=True)
                     
-                    msg = await app.send_video(
+                    msg = await tg_app.send_video(
                         chat_id=final_chat_id,
                         video=stream,
                         caption=caption,
@@ -342,7 +816,10 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
             print(f"WORKER: Retry {retry_count}/{max_retries} due to: {e}", flush=True)
             await asyncio.sleep(5)
 
-# --- SEND NOTIFICATION ---
+# ============================================================
+# SEND NOTIFICATION (unchanged)
+# ============================================================
+
 async def send_admin_notification(message, reply_markup=None):
     """Send notification to admin"""
     if not ADMIN_CHAT_ID:
@@ -356,8 +833,8 @@ async def send_admin_notification(message, reply_markup=None):
             api_hash=API_HASH, 
             bot_token=BOT_TOKEN, 
             workdir="/tmp"
-        ) as app:
-            await app.send_message(
+        ) as tg_app:
+            await tg_app.send_message(
                 chat_id=int(ADMIN_CHAT_ID),
                 text=message,
                 reply_markup=reply_markup
@@ -366,7 +843,10 @@ async def send_admin_notification(message, reply_markup=None):
     except Exception as e:
         print(f"NOTIFICATION ERROR: {e}", flush=True)
 
-# --- QUEUE WORKER ---
+# ============================================================
+# QUEUE WORKER (unchanged)
+# ============================================================
+
 JOB_QUEUE = queue.Queue()
 JOBS = {} 
 WORKER_THREAD = None
@@ -439,31 +919,28 @@ def ensure_worker_alive():
             WORKER_THREAD = threading.Thread(target=worker_loop, daemon=True)
             WORKER_THREAD.start()
 
-# --- FLASK ROUTES ---
+# ============================================================
+# FLASK ROUTES
+# ============================================================
+
 @app.route('/')
 def home(): 
     """Health check"""
     ensure_worker_alive()
-    reset_daily_counters()
-    
-    account_status = []
-    for i, acc in enumerate(PIKPAK_ACCOUNTS):
-        if acc.get('email'):
-            account_status.append({
-                f"account_{i+1}": f"{acc['daily_used']}/5 used"
-            })
-    
     return jsonify({
         "status": "online",
-        "service": "PikPak Bridge (4-Account Rotation)",
+        "service": "PikPak-Telegram Bridge",
         "queue": JOB_QUEUE.qsize(),
         "jobs": len(JOBS),
         "sessions": len(MESSAGE_SESSIONS),
-        "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False,
-        "accounts": account_status
+        "pikpak_accounts": len(PIKPAK_ACCOUNTS),
+        "worker_alive": WORKER_THREAD.is_alive() if WORKER_THREAD else False
     })
 
-# --- SESSION ROUTES ---
+# ============================================================
+# SESSION ROUTES (unchanged)
+# ============================================================
+
 @app.route('/start-session', methods=['POST'])
 def start_session():
     """Start message collection session"""
@@ -491,20 +968,20 @@ def add_magnet_to_session():
     
     with SESSION_LOCK:
         if poster_msg_id not in MESSAGE_SESSIONS:
-            print(f"SESSION ERROR: \"{poster_msg_id}\" not found. Available: {list(MESSAGE_SESSIONS.keys())}", flush=True)
+            print(f"SESSION ERROR: \"{poster_msg_id}\" not found.", flush=True)
             return jsonify({"error": "Session not found", "session_id": poster_msg_id}), 404
         
         session = MESSAGE_SESSIONS[poster_msg_id]
         
         if time.time() > session['timeout']:
             del MESSAGE_SESSIONS[poster_msg_id]
-            return jsonify({"error": "timeout", "message": "⏱️ Workflow timeout. Please send magnets and type 'done' to restart."}), 408
+            return jsonify({"error": "timeout"}), 408
         
         if len(session['magnets']) >= 3:
-            return jsonify({"error": "max_magnets", "message": "⚠️ Maximum 3 qualities allowed."}), 400
+            return jsonify({"error": "max_magnets"}), 400
         
         session['magnets'].append(magnet)
-        print(f"SESSION: Added magnet {len(session['magnets'])}/3 to \"{poster_msg_id}\"", flush=True)
+        print(f"SESSION: Added magnet {len(session['magnets'])}/3", flush=True)
     
     return jsonify({"status": "magnet_added", "count": len(session['magnets'])})
 
@@ -527,19 +1004,18 @@ def get_session(poster_msg_id):
 
 @app.route('/complete-session', methods=['POST'])
 def complete_session():
-    """Mark session as complete and return data"""
+    """Mark session as complete"""
     data = request.json
     poster_msg_id = str(data.get('poster_message_id'))
     
     with SESSION_LOCK:
         if poster_msg_id not in MESSAGE_SESSIONS:
-            print(f"SESSION ERROR: \"{poster_msg_id}\" not found. Available: {list(MESSAGE_SESSIONS.keys())}", flush=True)
-            return jsonify({"error": "Session not found", "session_id": poster_msg_id}), 404
+            return jsonify({"error": "Session not found"}), 404
         
         session = MESSAGE_SESSIONS[poster_msg_id]
         
         if len(session['magnets']) < 1:
-            return jsonify({"error": "no_magnets", "message": "⚠️ No magnet links found. Please send at least 1 magnet link."}), 400
+            return jsonify({"error": "no_magnets"}), 400
         
         result = {
             'metadata': session['metadata'],
@@ -548,7 +1024,7 @@ def complete_session():
         }
         
         del MESSAGE_SESSIONS[poster_msg_id]
-        print(f"SESSION: Completed \"{poster_msg_id}\" with {len(session['magnets'])} magnets", flush=True)
+        print(f"SESSION: Completed with {len(session['magnets'])} magnets", flush=True)
         
         return jsonify(result)
 
@@ -560,35 +1036,199 @@ def debug_sessions():
             "active_sessions": list(MESSAGE_SESSIONS.keys()),
             "session_data": {k: {
                 "magnets": len(v['magnets']),
-                "created": v['created'],
-                "timeout": v['timeout'],
                 "time_left": int(v['timeout'] - time.time())
             } for k, v in MESSAGE_SESSIONS.items()}
         })
 
-@app.route('/debug/accounts', methods=['GET'])
-def debug_accounts():
-    """Debug: Show account usage"""
-    reset_daily_counters()
-    
-    account_info = []
-    for i, acc in enumerate(PIKPAK_ACCOUNTS):
-        if acc.get('email'):
-            account_info.append({
-                "account": i + 1,
-                "email": acc['email'],
-                "daily_used": acc['daily_used'],
-                "limit": 5,
-                "available": 5 - acc['daily_used'],
-                "has_token": bool(acc.get('access_token'))
-            })
-    
-    return jsonify({
-        "accounts": account_info,
-        "total_available": sum(5 - acc['daily_used'] for acc in PIKPAK_ACCOUNTS if acc.get('email'))
-    })
+# ============================================================
+# PIKPAK ROUTES (NEW - replacing Seedr)
+# ============================================================
 
-# --- TELEGRAM UPLOAD ROUTES ---
+@app.route('/add-magnet', methods=['POST'])
+def add_magnet():
+    """
+    Add magnet to PikPak and return download link
+    Compatible with existing n8n workflow
+    """
+    max_retries = 3
+    retry_count = 0
+    last_error = None
+    
+    while retry_count < max_retries:
+        try:
+            magnet = request.json.get('magnet')
+            if not magnet:
+                return jsonify({"error": "Missing magnet parameter"}), 400
+            
+            print(f"PIKPAK: === ADD MAGNET START ===", flush=True)
+            
+            # 1. Select available account
+            account = select_available_account()
+            
+            # 2. Ensure logged in
+            tokens = ensure_logged_in(account)
+            
+            # 3. Add magnet
+            task = pikpak_add_magnet(magnet, account, tokens)
+            folder_id = task.get("file_id")
+            file_name = task.get("file_name", "Unknown")
+            
+            # 4. Poll until complete
+            pikpak_poll_download(folder_id, account, tokens, timeout=120)
+            
+            # 5. Refresh tokens (in case expired during poll)
+            tokens = ensure_logged_in(account)
+            
+            # 6. Get folder contents
+            files = pikpak_list_files(folder_id, account, tokens)
+            
+            # 7. Find video file
+            video_file = find_video_file(files)
+            if not video_file:
+                raise Exception("No video file found in download")
+            
+            # 8. Refresh tokens again
+            tokens = ensure_logged_in(account)
+            
+            # 9. Get download link
+            download_url = pikpak_get_download_link(video_file["id"], account, tokens)
+            
+            # 10. Increment usage counter
+            increment_account_usage(account["id"])
+            
+            print(f"PIKPAK: === ADD MAGNET SUCCESS ===", flush=True)
+            
+            # Return compatible response
+            return jsonify({
+                "result": True,
+                "folder_id": folder_id,
+                "file_id": video_file["id"],
+                "file_name": video_file.get("name", file_name),
+                "file_size": int(video_file.get("size", 0)),
+                "url": download_url,
+                "account_used": account["id"]
+            })
+            
+        except Exception as e:
+            last_error = str(e)
+            retry_count += 1
+            print(f"PIKPAK: Add magnet error (attempt {retry_count}/{max_retries}): {e}", flush=True)
+            
+            if retry_count < max_retries:
+                time.sleep(5)
+            else:
+                asyncio.run(send_admin_notification(
+                    f"⚠️ **PikPak Add Magnet Failed**\n\n"
+                    f"Retries: {max_retries}/{max_retries}\n"
+                    f"Error: {last_error}\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
+                ))
+                return jsonify({"error": last_error, "retries": max_retries}), 500
+
+@app.route('/list-files', methods=['POST'])
+def list_files():
+    """List PikPak folder contents"""
+    try:
+        folder_id = request.json.get('folder_id')
+        if not folder_id:
+            return jsonify({"error": "Missing folder_id"}), 400
+        
+        account = select_available_account()
+        tokens = ensure_logged_in(account)
+        
+        files = pikpak_list_files(folder_id, account, tokens)
+        
+        return jsonify({
+            "folders": [],
+            "files": files
+        })
+        
+    except Exception as e:
+        print(f"PIKPAK: List files error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get-link', methods=['POST'])
+def get_link():
+    """Get PikPak download link for file"""
+    try:
+        file_id = request.json.get('file_id')
+        if not file_id:
+            return jsonify({"error": "Missing file_id"}), 400
+        
+        account = select_available_account()
+        tokens = ensure_logged_in(account)
+        
+        download_url = pikpak_get_download_link(file_id, account, tokens)
+        
+        return jsonify({"url": download_url})
+        
+    except Exception as e:
+        print(f"PIKPAK: Get link error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/delete-folder', methods=['POST'])
+def delete_folder():
+    """Delete PikPak folder"""
+    try:
+        folder_id = request.json.get('folder_id')
+        if not folder_id or folder_id == 'null' or folder_id == 'None':
+            return jsonify({"error": "Invalid folder_id"}), 400
+        
+        account = select_available_account()
+        tokens = ensure_logged_in(account)
+        
+        pikpak_delete_file(folder_id, account, tokens)
+        
+        return jsonify({"result": True, "deleted_id": folder_id})
+        
+    except Exception as e:
+        print(f"PIKPAK: Delete error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/pikpak/status', methods=['GET'])
+def pikpak_status():
+    """Get PikPak accounts status"""
+    try:
+        tokens_data = load_pikpak_tokens()
+        usage = tokens_data.get("daily_usage", {})
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        accounts_status = []
+        total_remaining = 0
+        
+        for account in PIKPAK_ACCOUNTS:
+            account_key = f"account_{account['id']}"
+            account_usage = usage.get(account_key, {})
+            
+            if account_usage.get("date") != today:
+                downloads_today = 0
+            else:
+                downloads_today = account_usage.get("count", 0)
+            
+            remaining = 5 - downloads_today
+            total_remaining += remaining
+            
+            accounts_status.append({
+                "id": account["id"],
+                "email": account["email"],
+                "downloads_today": downloads_today,
+                "downloads_remaining": remaining,
+                "available": remaining > 0
+            })
+        
+        return jsonify({
+            "accounts": accounts_status,
+            "total_remaining": total_remaining,
+            "total_accounts": len(PIKPAK_ACCOUNTS)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================
+# UPLOAD & JOB ROUTES (unchanged)
+# ============================================================
+
 @app.route('/upload-telegram', methods=['POST'])
 def upload_telegram():
     """Upload video"""
@@ -639,280 +1279,17 @@ def detect_quality_api():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- PIKPAK API ROUTES ---
+# ============================================================
+# CLEANUP EXPIRED SESSIONS
+# ============================================================
 
-@app.route('/add-magnet', methods=['POST'])
-def add_magnet():
-    """Add magnet to PikPak with account rotation"""
-    max_retries = 3
-    retry_count = 0
-    
-    while retry_count < max_retries:
-        try:
-            magnet = request.json.get('magnet')
-            
-            # Get available account
-            account, account_index = get_available_account()
-            
-            if not account:
-                # All accounts exhausted
-                asyncio.run(send_admin_notification(
-                    f"⚠️ **All PikPak Accounts Exhausted**\n\n"
-                    f"All 4 accounts have reached their daily limit (5 torrents each).\n"
-                    f"Limits reset at midnight UTC.\n"
-                    f"Current time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                ))
-                return jsonify({
-                    "error": "All accounts exhausted",
-                    "message": "All 4 PikPak accounts have reached daily limit. Try after midnight UTC."
-                }), 429
-            
-            print(f"PIKPAK: Adding magnet with account {account_index+1}...", flush=True)
-            
-            headers = get_pikpak_headers(account)
-            
-            # Add offline download task
-            resp = requests.post(
-                "https://api-drive.mypikpak.com/drive/v1/files",
-                headers=headers,
-                json={
-                    "kind": "drive#file",
-                    "name": "",
-                    "upload_type": "UPLOAD_TYPE_URL",
-                    "url": {
-                        "url": magnet
-                    },
-                    "folder_type": "DOWNLOAD"
-                },
-                timeout=30
-            )
-            
-            result = resp.json()
-            
-            if 'error' in result:
-                error_code = result.get('error_code', 0)
-                
-                # Token expired
-                if error_code == 16:
-                    print(f"PIKPAK: Token expired, re-logging in...", flush=True)
-                    pikpak_login(account)
-                    raise Exception("Token expired, retry")
-                
-                raise Exception(f"PikPak error: {result.get('error_description', result.get('error', 'Unknown'))}")
-            
-            task = result.get('task', {})
-            task_id = task.get('id')
-            file_id = result.get('file', {}).get('id')
-            
-            if not task_id:
-                raise Exception("No task ID in response")
-            
-            # Increment usage
-            increment_account_usage(account_index)
-            
-            print(f"PIKPAK: ✅ Magnet added (Task ID: {task_id}, Account: {account_index+1})", flush=True)
-            
-            return jsonify({
-                "result": True,
-                "id": file_id or task_id,
-                "task_id": task_id,
-                "account_used": account_index + 1,
-                "code": 200
-            })
-            
-        except Exception as e:
-            last_error = str(e)
-            retry_count += 1
-            
-            if retry_count < max_retries:
-                print(f"PIKPAK: Retry {retry_count}/{max_retries} due to: {last_error}", flush=True)
-                time.sleep(10)
-            else:
-                asyncio.run(send_admin_notification(
-                    f"⚠️ **PikPak Add Failed**\n\n"
-                    f"Retries: {max_retries}/{max_retries}\n"
-                    f"Error: {last_error}\n"
-                    f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                ))
-                return jsonify({"error": last_error, "retries": max_retries}), 500
-
-@app.route('/list-files', methods=['POST'])
-def list_files():
-    """List PikPak files"""
-    max_retries = 3
-    retry_count = 0
-    
-    while retry_count < max_retries:
-        try:
-            folder_id = request.json.get('folder_id', '0')
-            
-            # Get any account (for listing)
-            account, _ = get_available_account()
-            if not account:
-                account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
-            
-            if not account:
-                return jsonify({"error": "No accounts configured"}), 500
-            
-            headers = get_pikpak_headers(account)
-            
-            # List files
-            if folder_id == '0':
-                # List root (all files)
-                resp = requests.get(
-                    "https://api-drive.mypikpak.com/drive/v1/files",
-                    headers=headers,
-                    params={
-                        "thumbnail_size": "SIZE_LARGE",
-                        "limit": 100,
-                        "filters": json.dumps({"phase": {"eq": "PHASE_TYPE_COMPLETE"}})
-                    },
-                    timeout=30
-                )
-            else:
-                # List specific folder
-                resp = requests.get(
-                    "https://api-drive.mypikpak.com/drive/v1/files",
-                    headers=headers,
-                    params={
-                        "parent_id": folder_id,
-                        "thumbnail_size": "SIZE_LARGE",
-                        "limit": 100
-                    },
-                    timeout=30
-                )
-            result = resp.json()
-            
-            if 'error' in result:
-                error_code = result.get('error_code', 0)
-                if error_code == 16:
-                    pikpak_login(account)
-                    raise Exception("Token expired, retry")
-                raise Exception(f"List error: {result.get('error', 'Unknown')}")
-            
-            files_data = result.get('files', [])
-            
-            if folder_id == '0':
-                # Return folders (completed downloads)
-                folders = [{
-                    'id': f['id'],
-                    'name': f['name']
-                } for f in files_data if f.get('kind') == 'drive#folder']
-                
-                return jsonify({"folders": folders, "files": []})
-            else:
-                # Return files in folder
-                files = [{
-                    'folder_file_id': f['id'],
-                    'name': f['name'],
-                    'size': f.get('size', 0)
-                } for f in files_data if f.get('kind') == 'drive#file']
-                
-                return jsonify({"files": files, "folders": []})
-            
-        except Exception as e:
-            retry_count += 1
-            if retry_count < max_retries:
-                print(f"PIKPAK: List retry {retry_count}/{max_retries}", flush=True)
-                time.sleep(10)
-            else:
-                return jsonify({"error": str(e)}), 500
-
-@app.route('/get-link', methods=['POST'])
-def get_link():
-    """Get download link from PikPak"""
-    try:
-        file_id = request.json.get('file_id')
-        # Get any account
-        account, _ = get_available_account()
-        if not account:
-            account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
-        
-        if not account:
-            return jsonify({"error": "No accounts configured"}), 500
-        
-        headers = = = get = get_pikpak_headers(account)
-        
-        print(f"PIKPAK: Getting download link for file {file_id}", flush=True)
-        
-        # Get file info
-        resp = requests.get(
-            f"https://api-drive.mypikpak.com/drive/v1/files/{file_id}",
-            headers=headers,
-            timeout=30
-        )
-        
-        result = resp.json()
-        
-        if 'error' in result:
-            raise Exception(f"Get link error: {result.get('error', 'Unknown')}")
-        
-        # Get web content link
-        web_content_link = result.get('web_content_link')
-        
-        if not web_content_link:
-            raise Exception("No download link available")
-        
-        print(f"PIKPAK: ✅ Got download link", flush=True)
-        
-        return jsonify({"url": web_content_link})
-        
-    except Exception as e:
-        print(f"PIKPAK ERROR: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/delete-folder', methods=['POST'])
-def delete_folder():
-    """Delete file/folder from PikPak"""
-    try:
-        folder_id = str(request.json.get('folder_id'))
-        if not folder_id or folder_id == 'null' or folder_id == 'None':
-            return jsonify({"error": "Invalid folder_id"}), 400
-        
-        # Get any account
-        account, _ = get_available_account()
-        if not account:
-            account = next((a for a in PIKPAK_ACCOUNTS if a.get('email')), None)
-        
-        if not account:
-            return jsonify({"error": "No accounts configured"}), 500
-        
-        headers = get_pikpak_headers(account)
-        
-        print(f"PIKPAK: Attempting to delete file/folder \"{folder_id}\"", flush=True)
-        
-        # Delete file
-        resp = requests.delete(
-            f"https://api-drive.mypikpak.com/drive/v1/files/{folder_id}",
-            headers=headers,
-            timeout=30
-        )
-        
-        # PikPak returns 204 No Content on successful delete
-        if resp.status_code == 204:
-            print(f"PIKPAK: ✅ File/folder {folder_id} successfully deleted!", flush=True)
-            return jsonify({"result": True, "code": 200})
-        
-        result = resp.json() if resp.text else {}
-        
-        if 'error' in result:
-            print(f"PIKPAK: Delete error: {result}", flush=True)
-        
-        print(f"PIKPAK: Delete response: {result}", flush=True)
-        
-        return jsonify({"result": True, "code": 200})
-        
-    except Exception as e:
-        print(f"PIKPAK ERROR: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-# --- CLEANUP EXPIRED SESSIONS ---
 def cleanup_sessions():
     """Remove expired sessions"""
     while True:
         try:
             time.sleep(60)
             current_time = time.time()
+            
             with SESSION_LOCK:
                 expired = [k for k, v in MESSAGE_SESSIONS.items() if current_time > v['timeout']]
                 for session_id in expired:
@@ -921,18 +1298,17 @@ def cleanup_sessions():
         except Exception as e:
             print(f"CLEANUP ERROR: {e}", flush=True)
 
-# Start cleanup thread
 cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
 cleanup_thread.start()
 
-if __name__ == '__main__':
-    print("=" * 60, flush=True)
-    print("🚀 PikPak Telegram Bridge Starting (4-Account Rotation)", flush=True)
-    print("=" * 60, flush=True)
-    # Initialize accounts
-    for i, acc in enumerate(PIKPAK_ACCOUNTS):
-        if acc.get('email'):
-            print(f"Account {i+1}: {acc['email']}", flush=True)
+# ============================================================
+# MAIN
+# ============================================================
 
+if __name__ == '__main__':
+    print("=" * 50, flush=True)
+    print("🚀 PikPak-Telegram Bridge Starting", flush=True)
+    print(f"📦 Loaded {len(PIKPAK_ACCOUNTS)} PikPak accounts", flush=True)
+    print("=" * 50, flush=True)
     ensure_worker_alive()
     app.run(host='0.0.0.0', port=10000)
