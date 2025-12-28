@@ -1162,32 +1162,32 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                     last_log_bytes[0] = 0
                     last_log_time[0] = time.time()
                     
-                    msg = await tg_app.send_video(
+                    msg = await tg_app.send_document(
                         chat_id=final_chat_id,
-                        video=stream,
+                        document=stream,
                         caption=caption,
                         file_name=filename,
-                        supports_streaming=True,
+                        force_document=True,
                         progress=progress_callback
                     )
-                    
+
                     elapsed = time.time() - start_time
                     avg_speed = (stream.total_size / elapsed) / (1024 * 1024)
-                    
+
                     clean_id = str(msg.chat.id).replace('-100', '')
                     private_link = f"https://t.me/c/{clean_id}/{msg.id}"
-                    
+
                     print(f"WORKER [{SERVER_ID}]: ✅ Upload complete! {elapsed:.1f}s ({avg_speed:.1f} MB/s avg)", flush=True)
                     print(f"WORKER [{SERVER_ID}]: Link: {private_link}", flush=True)
-                    
+
                     return {
                         "success": True,
                         "message_id": msg.id,
                         "chat_id": msg.chat.id,
-                        "file_id": msg.video.file_id,
+                        "file_id": msg.document.file_id,
                         "private_link": private_link,
-                        "file_size": msg.video.file_size,
-                        "duration": msg.video.duration,
+                        "file_size": msg.document.file_size,
+                        "duration": 0,
                         "upload_time": elapsed,
                         "avg_speed_mbps": avg_speed,
                         "server": SERVER_ID
