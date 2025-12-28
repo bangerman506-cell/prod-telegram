@@ -1088,22 +1088,24 @@ def debug_sessions():
 def add_magnet():
     """
     Add magnet to PikPak and return download link
-    Compatible with existing n8n workflow
+    Auto-rotates accounts on daily limit error
     """
-    max_retries = 3
-    retry_count = 0
-    last_error = None
+    magnet = request.json.get('magnet')
+    if not magnet:
+        return jsonify({"error": "Missing magnet parameter"}), 400
     
-    while retry_count < max_retries:
+    exhausted_accounts = []  # Track which accounts hit limit
+    max_total_retries = 8    # Total attempts across all accounts
+    attempt = 0
+    
+    while attempt < max_total_retries:
+        attempt += 1
+        
         try:
-            magnet = request.json.get('magnet')
-            if not magnet:
-                return jsonify({"error": "Missing magnet parameter"}), 400
+            print(f"PIKPAK: === ADD MAGNET ATTEMPT {attempt}/{max_total_retries} ===", flush=True)
             
-            print(f"PIKPAK: === ADD MAGNET START ===", flush=True)
-            
-            # 1. Select available account
-            account = select_available_account()
+            # 1. Select available account (excluding exhausted ones)
+            account = select_available_account(exclude_accounts=exhausted_accounts)
             
             # 2. Ensure logged in
             tokens = ensure_logged_in(account)
@@ -1150,20 +1152,44 @@ def add_magnet():
             })
             
         except Exception as e:
-            last_error = str(e)
-            retry_count += 1
-            print(f"PIKPAK: Add magnet error (attempt {retry_count}/{max_retries}): {e}", flush=True)
+            error_msg = str(e)
+            print(f"PIKPAK: Error on attempt {attempt}: {error_msg}", flush=True)
             
-            if retry_count < max_retries:
-                time.sleep(5)
-            else:
+            # Check if it's a daily limit error from PikPak
+            if "task_daily_create_limit" in error_msg or "daily" in error_msg.lower():
+                print(f"PIKPAK: ⚠️ Account {account['id']} hit daily limit!", flush=True)
+                
+                # Mark this account as exhausted
+                mark_account_exhausted(account["id"])
+                exhausted_accounts.append(account["id"])
+                
+                # Try next account immediately (don't count as failed attempt)
+                print(f"PIKPAK: 🔄 Rotating to next account...", flush=True)
+                continue
+            
+            # Check if all accounts exhausted
+            if "All PikPak accounts exhausted" in error_msg:
                 asyncio.run(send_admin_notification(
-                    f"⚠️ **PikPak Add Magnet Failed**\n\n"
-                    f"Retries: {max_retries}/{max_retries}\n"
-                    f"Error: {last_error}\n"
+                    f"⚠️ **All PikPak Accounts Exhausted**\n\n"
+                    f"All 4 accounts hit daily limit.\n"
                     f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
                 ))
-                return jsonify({"error": last_error, "retries": max_retries}), 500
+                return jsonify({"error": error_msg}), 500
+            
+            # Other errors - retry with same account
+            if attempt >= max_total_retries:
+                asyncio.run(send_admin_notification(
+                    f"⚠️ **PikPak Add Magnet Failed**\n\n"
+                    f"Attempts: {attempt}/{max_total_retries}\n"
+                    f"Error: {error_msg}\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
+                ))
+                return jsonify({"error": error_msg, "attempts": attempt}), 500
+            
+            print(f"PIKPAK: Retrying in 5 seconds...", flush=True)
+            time.sleep(5)
+    
+    return jsonify({"error": "Max retries exceeded"}), 500
 
 @app.route('/list-files', methods=['POST'])
 def list_files():
