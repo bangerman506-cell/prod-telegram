@@ -666,54 +666,131 @@ def pikpak_delete_file(file_id, account, tokens):
 # ============================================================
 
 class SmartStream(IOBase):
+    """High-speed streaming class with large buffer and prefetch"""
+    
+    BUFFER_SIZE = 4 * 1024 * 1024  # 4MB buffer for faster reads
+    
     def __init__(self, url, name):
         super().__init__()
         self.url = url
         self.name = name
         self.mode = 'rb'
+        self._closed = False
+        
         print(f"STREAM: Connecting to {url[:60]}...", flush=True)
+        
         try:
-            head = requests.head(url, allow_redirects=True, timeout=10, headers=HEADERS_STREAM)
+            head = requests.head(url, allow_redirects=True, timeout=15, headers=HEADERS_STREAM)
             self.total_size = int(head.headers.get('content-length', 0))
             print(f"STREAM: Size {self.total_size} bytes ({self.total_size/1024/1024:.1f}MB)", flush=True)
         except Exception as e:
-            print(f"STREAM WARNING: {e}", flush=True)
+            print(f"STREAM WARNING: HEAD failed: {e}", flush=True)
             self.total_size = 0
         
-        self.response = requests.get(url, stream=True, timeout=30, headers=HEADERS_STREAM)
-        self.raw = self.response.raw
-        self.raw.decode_content = True
+        # Use session with optimized settings
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=3
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        # Start streaming with large buffer
+        self.response = self.session.get(
+            url,
+            stream=True,
+            timeout=(10, 600),
+            headers=HEADERS_STREAM
+        )
+        self.response.raise_for_status()
+        
+        # Direct iterator for faster reads
+        self.iterator = self.response.iter_content(chunk_size=self.BUFFER_SIZE)
         self.current_pos = 0
-        self._closed = False
+        self._leftover = b''
     
     def read(self, size=-1):
-        if self._closed: 
-            raise ValueError("I/O closed")
-        data = self.raw.read(size)
-        if data: 
-            self.current_pos += len(data)
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+        
+        if size == -1 or size is None:
+            size = self.BUFFER_SIZE
+        
+        # Use leftover data first
+        if self._leftover:
+            if len(self._leftover) >= size:
+                data = self._leftover[:size]
+                self._leftover = self._leftover[size:]
+                self.current_pos += len(data)
+                return data
+            else:
+                data = self._leftover
+                self._leftover = b''
+        else:
+            data = b''
+        
+        # Read more chunks until we have enough
+        try:
+            while len(data) < size:
+                chunk = next(self.iterator, None)
+                if chunk is None:
+                    break
+                data += chunk
+        except StopIteration:
+            pass
+        except Exception as e:
+            print(f"STREAM ERROR: {e}", flush=True)
+        
+        # Store leftover for next read
+        if len(data) > size:
+            self._leftover = data[size:]
+            data = data[:size]
+        
+        self.current_pos += len(data)
         return data
     
     def seek(self, offset, whence=0):
-        if whence == 0: 
+        if whence == 0:
             self.current_pos = offset
-        elif whence == 1: 
+        elif whence == 1:
             self.current_pos += offset
-        elif whence == 2: 
+        elif whence == 2:
             self.current_pos = self.total_size + offset
         return self.current_pos
     
-    def tell(self): 
+    def tell(self):
         return self.current_pos
+    
+    def readable(self):
+        return True
+    
+    def writable(self):
+        return False
+    
+    def seekable(self):
+        return False
     
     def close(self):
         if not self._closed:
             self._closed = True
-            if hasattr(self, 'response'): 
-                self.response.close()
+            try:
+                if hasattr(self, 'response'):
+                    self.response.close()
+                if hasattr(self, 'session'):
+                    self.session.close()
+            except:
+                pass
     
-    def fileno(self): 
-        return None
+    def fileno(self):
+        raise OSError("Stream does not support fileno()")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        self.close()
 
 # ============================================================
 # METADATA EXTRACTION (unchanged)
@@ -780,42 +857,65 @@ def detect_quality_from_size(size_bytes):
 # ============================================================
 
 async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=0):
-    """Upload video with retry"""
+    """Upload video with optimized speed"""
     
     if file_size_mb > 2048:
         raise Exception(f"File too large: {file_size_mb:.1f}MB (max 2048MB)")
     
     max_retries = 3
     retry_count = 0
+    last_log_time = [time.time()]
+    last_log_bytes = [0]
+    
+    def progress_callback(current, total):
+        now = time.time()
+        elapsed = now - last_log_time[0]
+        
+        # Log every 5 seconds with speed info
+        if elapsed >= 5:
+            bytes_since = current - last_log_bytes[0]
+            speed_mbps = (bytes_since / elapsed) / (1024 * 1024)
+            percent = current * 100 // total if total > 0 else 0
+            
+            print(f"📊 {current/1024/1024:.1f}/{total/1024/1024:.1f}MB ({percent}%) - {speed_mbps:.1f} MB/s", flush=True)
+            
+            last_log_time[0] = now
+            last_log_bytes[0] = current
     
     while retry_count < max_retries:
         try:
             async with Client(
-                "bot_session", 
-                api_id=API_ID, 
-                api_hash=API_HASH, 
-                bot_token=BOT_TOKEN, 
+                "bot_session",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=BOT_TOKEN,
                 workdir="/tmp"
             ) as tg_app:
                 print(f"WORKER: Bot connected! (Attempt {retry_count + 1}/{max_retries})", flush=True)
                 
+                # Resolve chat ID
                 final_chat_id = None
                 chat_str = str(chat_target).strip()
                 
                 if chat_str.startswith("@"):
                     chat = await tg_app.get_chat(chat_str)
                     final_chat_id = chat.id
-                    print(f"WORKER: ✅ Resolved to ID: {final_chat_id}", flush=True)
+                    print(f"WORKER: ✅ Resolved {chat_str} to ID: {final_chat_id}", flush=True)
                 elif chat_str.lstrip("-").isdigit():
                     final_chat_id = int(chat_str)
                 else:
                     raise Exception(f"Invalid chat format: {chat_str}")
                 
+                # Stream and upload with optimized settings
+                start_time = time.time()
+                
                 with SmartStream(file_url, filename) as stream:
                     if stream.total_size == 0:
-                        raise Exception("File size is 0. Link expired or invalid.")
+                        raise Exception("File size is 0. Link may be expired.")
                     
                     print(f"WORKER: Uploading {filename} ({stream.total_size/1024/1024:.1f}MB)...", flush=True)
+                    last_log_bytes[0] = 0
+                    last_log_time[0] = time.time()
                     
                     msg = await tg_app.send_video(
                         chat_id=final_chat_id,
@@ -823,16 +923,17 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                         caption=caption,
                         file_name=filename,
                         supports_streaming=True,
-                        progress=lambda c, t: print(
-                            f"📊 {c/1024/1024:.1f}/{t/1024/1024:.1f}MB ({c*100//t}%)", 
-                            flush=True
-                        ) if c % (50*1024*1024) < 1024*1024 else None
+                        progress=progress_callback
                     )
+                    
+                    elapsed = time.time() - start_time
+                    avg_speed = (stream.total_size / elapsed) / (1024 * 1024)
                     
                     clean_id = str(msg.chat.id).replace('-100', '')
                     private_link = f"https://t.me/c/{clean_id}/{msg.id}"
                     
-                    print(f"WORKER: ✅ Upload complete! {private_link}", flush=True)
+                    print(f"WORKER: ✅ Upload complete! {elapsed:.1f}s ({avg_speed:.1f} MB/s avg)", flush=True)
+                    print(f"WORKER: Link: {private_link}", flush=True)
                     
                     return {
                         "success": True,
@@ -841,7 +942,9 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
                         "file_id": msg.video.file_id,
                         "private_link": private_link,
                         "file_size": msg.video.file_size,
-                        "duration": msg.video.duration
+                        "duration": msg.video.duration,
+                        "upload_time": elapsed,
+                        "avg_speed_mbps": avg_speed
                     }
         
         except FloodWait as e:
@@ -851,10 +954,14 @@ async def perform_upload(file_url, chat_target, caption, filename, file_size_mb=
             
         except Exception as e:
             retry_count += 1
+            error_msg = str(e)
+            print(f"WORKER: Error: {error_msg}", flush=True)
+            
             if retry_count >= max_retries:
-                raise Exception(f"Upload failed after {max_retries} retries: {e}")
-            print(f"WORKER: Retry {retry_count}/{max_retries} due to: {e}", flush=True)
-            await asyncio.sleep(5)
+                raise Exception(f"Upload failed after {max_retries} retries: {error_msg}")
+            
+            print(f"WORKER: Retry {retry_count}/{max_retries}...", flush=True)
+            await asyncio.sleep(3)
 
 # ============================================================
 # SEND NOTIFICATION (unchanged)
