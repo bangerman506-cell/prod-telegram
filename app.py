@@ -815,17 +815,14 @@ def pikpak_get_download_link(file_id, account, tokens):
         raise Exception(f"No download link in response: {data}")
 
 def pikpak_delete_file(file_id, account, tokens):
-    """
-    Delete file/folder from PikPak
-    Returns: True on success
-    """
-    print(f"PIKPAK: Deleting file {file_id}", flush=True)
+    """Delete file/folder from PikPak and try to empty trash"""
+    print(f"PIKPAK [{SERVER_ID}]: Deleting file {file_id}", flush=True)
     
     device_id = account["device_id"]
     user_id = tokens["user_id"]
     access_token = tokens["access_token"]
     
-    # Get fresh captcha
+    # Step 1: Move to trash
     captcha_sign, timestamp = generate_captcha_sign(device_id)
     captcha_token = get_pikpak_captcha(
         action="POST:/drive/v1/files:batchTrash",
@@ -844,14 +841,38 @@ def pikpak_delete_file(file_id, account, tokens):
         "x-captcha-token": captcha_token
     }
     
-    body = {
-        "ids": [file_id]
-    }
+    body = {"ids": [file_id]}
     
     response = requests.post(url, headers=headers, json=body, timeout=30)
     data = response.json()
     
-    print(f"PIKPAK: ✅ Delete response: {data}", flush=True)
+    print(f"PIKPAK [{SERVER_ID}]: ✅ Moved to trash: {data}", flush=True)
+    
+    # Step 2: Try to empty trash (non-blocking)
+    try:
+        captcha_sign2, timestamp2 = generate_captcha_sign(device_id)
+        captcha_token2 = get_pikpak_captcha(
+            action="PATCH:/drive/v1/files/trash:empty",
+            device_id=device_id,
+            user_id=user_id,
+            captcha_sign=captcha_sign2,
+            timestamp=timestamp2
+        )
+        
+        empty_url = f"{PIKPAK_API_DRIVE}/drive/v1/files/trash:empty"
+        headers2 = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "x-device-id": device_id,
+            "x-captcha-token": captcha_token2
+        }
+        
+        empty_response = requests.patch(empty_url, headers=headers2, json={}, timeout=30)
+        print(f"PIKPAK [{SERVER_ID}]: ✅ Trash emptied successfully", flush=True)
+        
+    except Exception as e:
+        print(f"PIKPAK [{SERVER_ID}]: ⚠️ Trash not emptied (continuing anyway): {e}", flush=True)
+    
     return True
 
 # ============================================================
