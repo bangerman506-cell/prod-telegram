@@ -1319,28 +1319,59 @@ def admin_reset_quota(account_id):
 def admin_test_magnet():
     """Test magnet link without downloading"""
     try:
-        magnet = request.json.get('magnet', '')
+        magnet = request.json.get('magnet', '').strip()
         
-        if not magnet or not magnet.startswith('magnet:'):
-            return jsonify({"valid": False, "error": "Invalid magnet format"})
+        if not magnet:
+            return jsonify({"valid": False, "error": "No magnet provided"})
+        
+        # Handle quality prefix (e.g., "720p-magnet:?...")
+        original_magnet = magnet
+        if '-magnet:' in magnet:
+            parts = magnet.split('-', 1)
+            if len(parts) == 2:
+                magnet = parts[1]
+        
+        if not magnet.startswith('magnet:?'):
+            return jsonify({"valid": False, "error": "Invalid magnet format. Must start with 'magnet:?'"})
         
         # Extract name from magnet
         name = "Unknown"
         dn_match = re.search(r'dn=([^&]+)', magnet)
         if dn_match:
             name = dn_match.group(1)
-            name = name.replace('+', ' ').replace('%20', ' ')
+            name = name.replace('+', ' ').replace('%20', ' ').replace('%28', '(').replace('%29', ')')
         
-        # Detect quality
-        quality = detect_quality_from_magnet(magnet) or "Unknown"
+        # Detect quality from magnet name or prefix
+        quality = "Unknown"
+        
+        # First check prefix
+        if original_magnet.startswith('1080p-'):
+            quality = "1080p"
+        elif original_magnet.startswith('720p-'):
+            quality = "720p"
+        elif original_magnet.startswith('480p-'):
+            quality = "480p"
+        elif original_magnet.startswith('2160p-') or original_magnet.startswith('4k-'):
+            quality = "4K"
+        else:
+            # Try to detect from name
+            name_lower = name.lower()
+            if '1080p' in name_lower:
+                quality = "1080p"
+            elif '720p' in name_lower:
+                quality = "720p"
+            elif '480p' in name_lower:
+                quality = "480p"
+            elif '2160p' in name_lower or '4k' in name_lower:
+                quality = "4K"
         
         # Find available account
-        available_account = None
+        available_account = "None available"
         try:
             account = select_available_account()
             available_account = account["id"]
         except:
-            available_account = "None available"
+            pass
         
         return jsonify({
             "valid": True,
@@ -1348,6 +1379,7 @@ def admin_test_magnet():
             "quality": quality,
             "account": available_account
         })
+        
     except Exception as e:
         return jsonify({"valid": False, "error": str(e)})
 
