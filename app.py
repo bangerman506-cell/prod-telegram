@@ -1912,8 +1912,10 @@ def check_duplicate_by_hash(magnet_link, account, tokens, user_quality):
             
         print(f"PIKPAK [{SERVER_ID}]: Input hash: '{input_hash}'", flush=True)
 
-        # List ALL files in the root directory (My Pack)
-        files = pikpak_list_files(None, account, tokens) # None means root
+        # List files in the target directory (My Pack)
+        target_folder = account.get("my_pack_id") or None
+        print(f"PIKPAK [{SERVER_ID}]: Listing files in folder: {target_folder or 'Root'}", flush=True)
+        files = pikpak_list_files(target_folder, account, tokens)
         print(f"PIKPAK [{SERVER_ID}]: Found {len(files)} files in 'My Pack'. Starting hash comparison.", flush=True)
 
         for file in files:
