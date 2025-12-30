@@ -683,6 +683,8 @@ def pikpak_poll_download(file_id, account, tokens, timeout=120):
     poll_interval = 5
     
     while time.time() - start_time < timeout:
+        if EMERGENCY_STOP:
+            raise Exception("Emergency stop activated during polling")
         try:
             captcha_sign, timestamp = generate_captcha_sign(device_id)
             captcha_token = get_pikpak_captcha(
