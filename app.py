@@ -162,6 +162,74 @@ PIKPAK_ACCOUNTS = load_pikpak_accounts()
 PIKPAK_TOKENS_FILE = f"/tmp/pikpak_tokens_{SERVER_ID}.json"
 PIKPAK_LOCK = threading.Lock()
 MAGNET_ADD_LOCK = threading.Lock()
+PIKPAK_STORAGE_CACHE = {}
+PIKPAK_STORAGE_CACHE_TIME = {}
+
+def get_account_storage(account_id):
+    """Get storage info for account with caching"""
+    global PIKPAK_STORAGE_CACHE, PIKPAK_STORAGE_CACHE_TIME
+    
+    cache_key = f"account_{account_id}"
+    current_time = time.time()
+    
+    # Return cached if less than 5 minutes old
+    if cache_key in PIKPAK_STORAGE_CACHE:
+        if current_time - PIKPAK_STORAGE_CACHE_TIME.get(cache_key, 0) < 300:
+            return PIKPAK_STORAGE_CACHE[cache_key]
+    
+    try:
+        account = None
+        for acc in PIKPAK_ACCOUNTS:
+            if acc["id"] == account_id:
+                account = acc
+                break
+        
+        if not account:
+            return {"used_gb": 0, "total_gb": 6, "percent": 0}
+        
+        tokens = ensure_logged_in(account)
+        device_id = account["device_id"]
+        user_id = tokens["user_id"]
+        access_token = tokens["access_token"]
+        
+        captcha_sign, timestamp = generate_captcha_sign(device_id)
+        captcha_token = get_pikpak_captcha(
+            action="GET:/drive/v1/about",
+            device_id=device_id,
+            user_id=user_id,
+            captcha_sign=captcha_sign,
+            timestamp=timestamp
+        )
+        
+        url = f"{PIKPAK_API_DRIVE}/drive/v1/about"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "x-device-id": device_id,
+            "x-captcha-token": captcha_token
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        data = response.json()
+        
+        quota = data.get("quota", {})
+        used_bytes = int(quota.get("usage", 0))
+        total_bytes = int(quota.get("limit", 6 * 1024 * 1024 * 1024))
+        
+        used_gb = round(used_bytes / (1024 * 1024 * 1024), 2)
+        total_gb = round(total_bytes / (1024 * 1024 * 1024), 2)
+        percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 0
+        
+        result = {"used_gb": used_gb, "total_gb": total_gb, "percent": percent}
+        
+        PIKPAK_STORAGE_CACHE[cache_key] = result
+        PIKPAK_STORAGE_CACHE_TIME[cache_key] = current_time
+        
+        return result
+        
+    except Exception as e:
+        print(f"PIKPAK [{SERVER_ID}]: Storage check failed for account {account_id}: {e}", flush=True)
+        return {"used_gb": 0, "total_gb": 6, "percent": 0}
+
 # ============================================================
 # STARTUP QUOTA CHECK (Add after load_pikpak_accounts)
 # ============================================================
@@ -175,50 +243,19 @@ def check_all_accounts_quota():
     
     if "daily_usage" not in tokens:
         tokens["daily_usage"] = {}
+        save_pikpak_tokens(tokens)
     
     for account in PIKPAK_ACCOUNTS:
         try:
-            # Login to get current status
-            account_tokens = ensure_logged_in(account)
+            # Login and get storage (this handles login, captcha, and caching)
+            storage = get_account_storage(account['id'])
             
-            # Get account info (doesn't consume quota)
-            device_id = account["device_id"]
-            user_id = account_tokens["user_id"]
-            access_token = account_tokens["access_token"]
-            
-            # Check VIP/quota status
-            captcha_sign, timestamp = generate_captcha_sign(device_id)
-            captcha_token = get_pikpak_captcha(
-                action="GET:/drive/v1/about",
-                device_id=device_id,
-                user_id=user_id,
-                captcha_sign=captcha_sign,
-                timestamp=timestamp
-            )
-            
-            url = f"{PIKPAK_API_DRIVE}/drive/v1/about"
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "x-device-id": device_id,
-                "x-captcha-token": captcha_token
-            }
-            
-            response = requests.get(url, headers=headers, timeout=30)
-            data = response.json()
-            
-            # Log account status
-            quota_data = data.get("quota", {})
-            quota_used = int(quota_data.get("usage", 0))
-            quota_limit = int(quota_data.get("limit", 0))
-            PIKPAK_STORAGE_CACHE[account['id']] = {"usage": quota_used, "limit": quota_limit}
-            
-            print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Storage: {quota_used}/{quota_limit}", flush=True)
+            print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Storage: {storage['used_gb']}GB/{storage['total_gb']}GB ({storage['percent']}%)", flush=True)
             print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Login successful ✅", flush=True)
             
         except Exception as e:
             print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Check failed: {e}", flush=True)
     
-    save_pikpak_tokens(tokens)
     print(f"PIKPAK [{SERVER_ID}]: Startup quota check complete", flush=True)
 # ============================================================
 # PIKPAK TOKEN STORAGE
@@ -1296,23 +1333,8 @@ def admin_dashboard():
 def admin_get_storage(account_id):
     """Get storage usage for specific account"""
     try:
-        account = next((a for a in PIKPAK_ACCOUNTS if a["id"] == account_id), None)
-        if not account:
-            return jsonify({"error": "Account not found"}), 404
-            
-        tokens = ensure_logged_in(account)
-        storage = get_pikpak_storage_info(account, tokens)
-        PIKPAK_STORAGE_CACHE[account_id] = storage
-        
-        used_gb = round(storage["usage"] / (1024**3), 2)
-        total_gb = round(storage["limit"] / (1024**3), 2)
-        percent = int((storage["usage"] / storage["limit"]) * 100) if storage["limit"] > 0 else 0
-        
-        return jsonify({
-            "used_gb": used_gb,
-            "total_gb": total_gb,
-            "percent": percent
-        })
+        storage = get_account_storage(account_id)
+        return jsonify(storage)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1346,9 +1368,9 @@ def admin_clear_trash(account_id):
         }
         requests.patch(url, headers=headers, json={}, timeout=30)
         
-        # Update storage cache
-        storage = get_pikpak_storage_info(account, tokens)
-        PIKPAK_STORAGE_CACHE[account_id] = storage
+        # Invalidate cache
+        if f"account_{account_id}" in PIKPAK_STORAGE_CACHE:
+            del PIKPAK_STORAGE_CACHE[f"account_{account_id}"]
         
         return jsonify({"success": True, "message": "Trash cleared"})
     except Exception as e:
@@ -1447,10 +1469,7 @@ def admin_api_status():
         remaining = 5 - downloads_today
         total_remaining += remaining
         
-        storage = PIKPAK_STORAGE_CACHE.get(account["id"], {"usage": 0, "limit": 0})
-        usage_gb = round(storage["usage"] / (1024**3), 2)
-        total_gb = round(storage["limit"] / (1024**3), 2)
-        percent = int((storage["usage"] / storage["limit"]) * 100) if storage["limit"] > 0 else 0
+        storage = get_account_storage(account["id"])
         
         accounts_list.append({
             "id": account["id"],
@@ -1458,9 +1477,9 @@ def admin_api_status():
             "downloads_today": downloads_today,
             "downloads_remaining": remaining,
             "available": remaining > 0,
-            "storage_used_gb": usage_gb,
-            "storage_total_gb": total_gb,
-            "storage_percent": percent
+            "storage_used_gb": storage["used_gb"],
+            "storage_total_gb": storage["total_gb"],
+            "storage_percent": storage["percent"]
         })
     
     sessions_list = []
@@ -1496,7 +1515,7 @@ def admin_api_status():
             "id": SERVER_ID,
             "mode": SERVER_MODE,
             "url": SERVER_URL,
-            "handles": "1080p only"
+            "handles": "1080p, 2160p, 4K (large files)"
         },
         "system": {
             "status": "online",
