@@ -130,6 +130,20 @@ body {
     background: #2ea043;
 }
 
+.btn-warning {
+    background: var(--accent-warning);
+    color: white;
+}
+
+.btn-warning:hover {
+    background: #b0801b;
+}
+
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 0.8rem;
+}
+
 .btn-small {
     padding: 6px 12px;
     font-size: 0.8rem;

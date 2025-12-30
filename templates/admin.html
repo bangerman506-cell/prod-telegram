@@ -15,6 +15,8 @@
                 <span class="version" id="version">v2.0.0</span>
             </div>
             <div class="header-right">
+                <button onclick="clearAllTrash()" class="btn btn-warning">🗑️ Clear All Trash</button>
+                <button onclick="clearAllMyPack()" class="btn btn-danger">📁 Clear All My Pack</button>
                 <button class="btn btn-secondary" onclick="refreshData()">🔄 Refresh</button>
                 <button class="btn btn-danger" id="emergencyBtn" onclick="toggleEmergency()">
                     🔴 EMERGENCY STOP
@@ -69,6 +71,7 @@
                             <th>#</th>
                             <th>Email</th>
                             <th>Usage</th>
+                            <th>Storage</th>
                             <th>Status</th>
                             <th>Action</th>
                         </tr>
@@ -210,9 +213,17 @@
                             </div>
                             <span>${acc.downloads_today}/5</span>
                         </td>
+                        <td>
+                            <div class="usage-mini">
+                                <div class="usage-mini-bar" style="width: ${acc.storage_percent}%"></div>
+                            </div>
+                            <span style="font-size: 0.85rem">${acc.storage_used_gb}GB / ${acc.storage_total_gb}GB (${acc.storage_percent}%)</span>
+                        </td>
                         <td class="${statusClass}">${statusText}</td>
                         <td>
                             <button class="btn btn-small btn-secondary" onclick="resetQuota(${acc.id})">Reset</button>
+                            <button onclick="clearTrash(${acc.id})" class="btn btn-sm btn-warning" title="Clear Trash">🗑️</button>
+                            <button onclick="clearMyPack(${acc.id})" class="btn btn-sm btn-danger" title="Clear My Pack">📁</button>
                         </td>
                     `;
                     accountsTable.appendChild(row);

@@ -207,8 +207,10 @@ def check_all_accounts_quota():
             data = response.json()
             
             # Log account status
-            quota_used = data.get("quota", {}).get("usage", 0)
-            quota_limit = data.get("quota", {}).get("limit", 0)
+            quota_data = data.get("quota", {})
+            quota_used = int(quota_data.get("usage", 0))
+            quota_limit = int(quota_data.get("limit", 0))
+            PIKPAK_STORAGE_CACHE[account['id']] = {"usage": quota_used, "limit": quota_limit}
             
             print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Storage: {quota_used}/{quota_limit}", flush=True)
             print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Login successful ✅", flush=True)
@@ -272,6 +274,41 @@ def generate_captcha_sign(device_id):
     captcha_sign = "1." + result
     
     return captcha_sign, timestamp
+
+# ============================================================
+# PIKPAK STORAGE HELPER
+# ============================================================
+
+def get_pikpak_storage_info(account, tokens):
+    """Get storage info for account"""
+    device_id = account["device_id"]
+    user_id = tokens["user_id"]
+    access_token = tokens["access_token"]
+    
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    captcha_token = get_pikpak_captcha(
+        action="GET:/drive/v1/about",
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
+    
+    url = f"{PIKPAK_API_DRIVE}/drive/v1/about"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "x-device-id": device_id,
+        "x-captcha-token": captcha_token
+    }
+    
+    response = requests.get(url, headers=headers, timeout=30)
+    data = response.json()
+    
+    quota = data.get("quota", {})
+    return {
+        "usage": int(quota.get("usage", 0)),
+        "limit": int(quota.get("limit", 0))
+    }
 
 # ============================================================
 # PIKPAK API HELPERS
@@ -1255,6 +1292,138 @@ def admin_dashboard():
     """Serve admin dashboard HTML"""
     return render_template('admin.html')
 
+@app.route('/admin/api/storage/<int:account_id>')
+def admin_get_storage(account_id):
+    """Get storage usage for specific account"""
+    try:
+        account = next((a for a in PIKPAK_ACCOUNTS if a["id"] == account_id), None)
+        if not account:
+            return jsonify({"error": "Account not found"}), 404
+            
+        tokens = ensure_logged_in(account)
+        storage = get_pikpak_storage_info(account, tokens)
+        PIKPAK_STORAGE_CACHE[account_id] = storage
+        
+        used_gb = round(storage["usage"] / (1024**3), 2)
+        total_gb = round(storage["limit"] / (1024**3), 2)
+        percent = int((storage["usage"] / storage["limit"]) * 100) if storage["limit"] > 0 else 0
+        
+        return jsonify({
+            "used_gb": used_gb,
+            "total_gb": total_gb,
+            "percent": percent
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/api/clear-trash/<int:account_id>', methods=['POST'])
+def admin_clear_trash(account_id):
+    """Empty trash for specific account"""
+    try:
+        account = next((a for a in PIKPAK_ACCOUNTS if a["id"] == account_id), None)
+        if not account:
+            return jsonify({"error": "Account not found"}), 404
+            
+        print(f"PIKPAK [{SERVER_ID}]: Clearing trash for account {account_id}", flush=True)
+        tokens = ensure_logged_in(account)
+        
+        # Empty trash
+        device_id = account["device_id"]
+        captcha_sign, timestamp = generate_captcha_sign(device_id)
+        captcha_token = get_pikpak_captcha(
+            action="PATCH:/drive/v1/files/trash:empty",
+            device_id=device_id,
+            user_id=tokens["user_id"],
+            captcha_sign=captcha_sign,
+            timestamp=timestamp
+        )
+        
+        url = f"{PIKPAK_API_DRIVE}/drive/v1/files/trash:empty"
+        headers = {
+            "Authorization": f"Bearer {tokens['access_token']}",
+            "x-device-id": device_id,
+            "x-captcha-token": captcha_token
+        }
+        requests.patch(url, headers=headers, json={}, timeout=30)
+        
+        # Update storage cache
+        storage = get_pikpak_storage_info(account, tokens)
+        PIKPAK_STORAGE_CACHE[account_id] = storage
+        
+        return jsonify({"success": True, "message": "Trash cleared"})
+    except Exception as e:
+        print(f"PIKPAK [{SERVER_ID}]: Failed to clear trash for account {account_id}: {e}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/admin/api/clear-mypack/<int:account_id>', methods=['POST'])
+def admin_clear_mypack(account_id):
+    """Delete ALL files in the root folder (My Pack)"""
+    try:
+        account = next((a for a in PIKPAK_ACCOUNTS if a["id"] == account_id), None)
+        if not account:
+            return jsonify({"error": "Account not found"}), 404
+            
+        print(f"PIKPAK [{SERVER_ID}]: Clearing My Pack for account {account_id}", flush=True)
+        tokens = ensure_logged_in(account)
+        
+        # List files in root
+        files = pikpak_list_files("root", account, tokens)
+        deleted_count = len(files)
+        
+        if files:
+            # Batch trash
+            device_id = account["device_id"]
+            captcha_sign, timestamp = generate_captcha_sign(device_id)
+            captcha_token = get_pikpak_captcha(
+                action="POST:/drive/v1/files:batchTrash",
+                device_id=device_id,
+                user_id=tokens["user_id"],
+                captcha_sign=captcha_sign,
+                timestamp=timestamp
+            )
+            
+            url = f"{PIKPAK_API_DRIVE}/drive/v1/files:batchTrash"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {tokens['access_token']}",
+                "x-device-id": device_id,
+                "x-captcha-token": captcha_token
+            }
+            body = {"ids": [f["id"] for f in files]}
+            requests.post(url, headers=headers, json=body, timeout=30)
+            
+            # Empty trash
+            admin_clear_trash(account_id)
+        
+        return jsonify({"success": True, "message": "My Pack cleared", "files_deleted": deleted_count})
+    except Exception as e:
+        print(f"PIKPAK [{SERVER_ID}]: Failed to clear My Pack for account {account_id}: {e}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/admin/api/clear-all-trash', methods=['POST'])
+def admin_clear_all_trash():
+    """Empty trash for ALL accounts"""
+    count = 0
+    for account in PIKPAK_ACCOUNTS:
+        try:
+            admin_clear_trash(account["id"])
+            count += 1
+        except:
+            pass
+    return jsonify({"success": True, "accounts_cleared": count})
+
+@app.route('/admin/api/clear-all-mypack', methods=['POST'])
+def admin_clear_all_mypack():
+    """Clear My Pack for ALL accounts"""
+    count = 0
+    for account in PIKPAK_ACCOUNTS:
+        try:
+            admin_clear_mypack(account["id"])
+            count += 1
+        except:
+            pass
+    return jsonify({"success": True, "accounts_cleared": count})
+
 @app.route('/admin/api/status')
 def admin_api_status():
     """Get complete admin dashboard data"""
@@ -1278,12 +1447,20 @@ def admin_api_status():
         remaining = 5 - downloads_today
         total_remaining += remaining
         
+        storage = PIKPAK_STORAGE_CACHE.get(account["id"], {"usage": 0, "limit": 0})
+        usage_gb = round(storage["usage"] / (1024**3), 2)
+        total_gb = round(storage["limit"] / (1024**3), 2)
+        percent = int((storage["usage"] / storage["limit"]) * 100) if storage["limit"] > 0 else 0
+        
         accounts_list.append({
             "id": account["id"],
             "email": account["email"],
             "downloads_today": downloads_today,
             "downloads_remaining": remaining,
-            "available": remaining > 0
+            "available": remaining > 0,
+            "storage_used_gb": usage_gb,
+            "storage_total_gb": total_gb,
+            "storage_percent": percent
         })
     
     sessions_list = []
