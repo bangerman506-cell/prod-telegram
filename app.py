@@ -1817,6 +1817,13 @@ def extract_magnet_info(magnet_link):
     
     return {"name": name, "hash": btih_hash}
 
+def extract_hash(magnet_link):
+    """Extracts the BTIH hash from a magnet link and normalizes it."""
+    match = re.search(r'xt=urn:btih:([a-zA-Z0-9]+)', magnet_link, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
 def normalize_name(name):
     """Normalizes a name for fuzzy matching by lowercasing and removing symbols."""
     if not name:
@@ -1826,8 +1833,8 @@ def normalize_name(name):
 
 def check_duplicate(magnet_link, account, tokens, user_quality):
     """
-    Checks for duplicates in PikPak before adding a magnet.
-    Returns file info dictionary if a duplicate is found, otherwise None.
+    DEPRECATED: This function uses fuzzy name matching which is less reliable.
+    Use check_duplicate_by_hash for a more robust check.
     """
     try:
         print(f"PIKPAK [{SERVER_ID}]: Running smart duplicate check...", flush=True)
@@ -1890,6 +1897,70 @@ def check_duplicate(magnet_link, account, tokens, user_quality):
         print(f"PIKPAK [{SERVER_ID}]: Smart duplicate check failed (continuing): {e}", flush=True)
         return None
 
+def check_duplicate_by_hash(magnet_link, account, tokens, user_quality):
+    """
+    Checks for duplicates by BTIH hash against ALL files in the root directory.
+    Returns file info dictionary if a duplicate is found, otherwise None.
+    """
+    try:
+        print(f"PIKPAK [{SERVER_ID}]: Running robust duplicate check by hash...", flush=True)
+        input_hash = extract_hash(magnet_link)
+        
+        if not input_hash:
+            print(f"PIKPAK [{SERVER_ID}]: Could not extract hash from magnet link.", flush=True)
+            return None
+            
+        print(f"PIKPAK [{SERVER_ID}]: Input hash: '{input_hash}'", flush=True)
+
+        # List ALL files in the root directory (My Pack)
+        files = pikpak_list_files(None, account, tokens) # None means root
+        print(f"PIKPAK [{SERVER_ID}]: Found {len(files)} files in 'My Pack'. Starting hash comparison.", flush=True)
+
+        for file in files:
+            file_name = file.get('name', 'Unknown')
+            try:
+                # Get detailed file info to check the hash
+                file_info = pikpak_get_file_info(file['id'], account, tokens)
+                params_url = file_info.get("params", {}).get("url", "")
+                
+                # Check if the normalized hash from the magnet is in the file's metadata URL
+                is_match = input_hash in params_url.upper()
+                print(f"PIKPAK [{SERVER_ID}]: Checking file '{file_name}': Hash match? {is_match}", flush=True)
+                
+                if is_match:
+                    print(f"PIKPAK [{SERVER_ID}]: ✅ Quota Saved! Found existing file by hash: '{file_name}' (ID: {file['id']})", flush=True)
+                    log_activity("info", f"Found duplicate by hash: {file_name}")
+                    
+                    # Prepare response for the found duplicate
+                    download_url = pikpak_get_download_link(file['id'], account, tokens)
+                    file_size = int(file.get('size', 0))
+                    detected_quality = detect_quality(user_quality, magnet_link, file_size)
+                    
+                    return {
+                       "result": True,
+                       "folder_id": file['id'],
+                       "file_id": file['id'],
+                       "file_name": file['name'],
+                       "file_size": file_size,
+                       "url": download_url,
+                       "account_used": account["id"],
+                       "file_type": "file",
+                       "quality_detected": detected_quality,
+                       "server": SERVER_ID,
+                       "quota_saved": True
+                    }
+            except Exception as e:
+                print(f"PIKPAK [{SERVER_ID}]: Could not verify hash for file '{file_name}' (ID: {file['id']}): {e}", flush=True)
+                continue # Move to the next file
+        
+        print(f"PIKPAK [{SERVER_ID}]: No hash match found after checking all files.", flush=True)
+        return None
+
+    except Exception as e:
+        print(f"PIKPAK [{SERVER_ID}]: Robust duplicate check failed: {e}", flush=True)
+        return None
+
+
 @app.route('/add-magnet', methods=['POST'])
 def add_magnet():
     """Add magnet to PikPak and return download link"""
@@ -1928,8 +1999,8 @@ def add_magnet():
                 last_account_id = account["id"]
                 tokens = ensure_logged_in(account)
 
-                # 2. Smart Duplicate Check
-                duplicate_file = check_duplicate(magnet, account, tokens, user_quality)
+                # 2. Robust Duplicate Check by Hash
+                duplicate_file = check_duplicate_by_hash(magnet, account, tokens, user_quality)
                 if duplicate_file:
                     # If duplicate found, return its info and skip adding
                     return jsonify(duplicate_file)
