@@ -3,3 +3,5 @@ requests
 gunicorn
 pyrogram
 tgcrypto
+supabase
+python-dotenv
