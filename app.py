@@ -1517,68 +1517,7 @@ def admin_reset_quota(account_id):
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route('/admin/api/test-magnet', methods=['POST'])
-def admin_test_magnet():
-    """Test magnet link without downloading"""
-    try:
-        magnet = request.json.get('magnet', '').strip()
-        
-        if not magnet:
-            return jsonify({"valid": False, "error": "No magnet provided"})
-        
-        original_magnet = magnet
-        if '-magnet:' in magnet:
-            parts = magnet.split('-', 1)
-            if len(parts) == 2:
-                magnet = parts[1]
-        
-        if not magnet.startswith('magnet:?'):
-            return jsonify({"valid": False, "error": "Invalid magnet format. Must start with 'magnet:?'"})
-        
-        name = "Unknown"
-        dn_match = re.search(r'dn=([^&]+)', magnet)
-        if dn_match:
-            name = dn_match.group(1)
-            name = name.replace('+', ' ').replace('%20', ' ').replace('%28', '(').replace('%29', ')')
-        
-        quality = "Unknown"
-        
-        if original_magnet.startswith('1080p-'):
-            quality = "1080p"
-        elif original_magnet.startswith('720p-'):
-            quality = "720p"
-        elif original_magnet.startswith('480p-'):
-            quality = "480p"
-        elif original_magnet.startswith('2160p-') or original_magnet.startswith('4k-'):
-            quality = "4K"
-        else:
-            name_lower = name.lower()
-            if '1080p' in name_lower:
-                quality = "1080p"
-            elif '720p' in name_lower:
-                quality = "720p"
-            elif '480p' in name_lower:
-                quality = "480p"
-            elif '2160p' in name_lower or '4k' in name_lower:
-                quality = "4K"
-        
-        available_account = "None available"
-        try:
-            account = select_available_account()
-            available_account = account["id"]
-        except:
-            pass
-        
-        return jsonify({
-            "valid": True,
-            "name": name,
-            "quality": quality,
-            "account": available_account,
-            "server": SERVER_ID
-        })
-        
-    except Exception as e:
-        return jsonify({"valid": False, "error": str(e)})
+
 
 # ============================================================
 # FLASK ROUTES (MODIFIED - Added server info)
