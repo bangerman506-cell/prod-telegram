@@ -1324,6 +1324,8 @@ def admin_clear_trash(account_id):
         # Invalidate cache
         if f"account_{account_id}" in PIKPAK_STORAGE_CACHE:
             del PIKPAK_STORAGE_CACHE[f"account_{account_id}"]
+
+        get_account_storage(account)
         
         return jsonify({"success": True, "message": "Trash cleared"})
     except Exception as e:
@@ -1370,8 +1372,6 @@ def admin_clear_mypack(account_id):
             requests.post(url, headers=headers, json=body, timeout=30)
             
             admin_clear_trash(account_id)
-        
-        get_account_storage(account)
         
         return jsonify({"success": True, "message": "My Pack cleared", "files_deleted": deleted_count})
     except Exception as e:
