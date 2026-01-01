@@ -1371,6 +1371,8 @@ def admin_clear_mypack(account_id):
             
             admin_clear_trash(account_id)
         
+        get_account_storage(account)
+        
         return jsonify({"success": True, "message": "My Pack cleared", "files_deleted": deleted_count})
     except Exception as e:
         print(f"PIKPAK [{SERVER_ID}]: Failed to clear My Pack for account {account_id}: {e}", flush=True)
