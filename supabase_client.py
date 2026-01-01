@@ -113,5 +113,15 @@ class SupabaseDB:
             print(f"❌ DB Error (reset_account_quota): {e}")
             return False
 
+    def sync_quota(self, account_id: int, usage: int):
+        """Sync local DB quota with real PikPak usage"""
+        try:
+            self.client.table('accounts').update({
+                'quota_used': usage,
+                'last_used_at': datetime.now(timezone.utc).isoformat()
+            }).eq('id', account_id).execute()
+        except Exception as e:
+            print(f"❌ DB Error (sync_quota): {e}")
+
 # Singleton instance
 db = SupabaseDB()

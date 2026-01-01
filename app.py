@@ -189,7 +189,26 @@ def get_account_storage(account):
         total_gb = round(total_bytes / (1024 * 1024 * 1024), 2)
         percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 0
         
-        result = {"used_gb": used_gb, "total_gb": total_gb, "percent": percent}
+        # Extract the download quota from the API response
+        cloud_quota = data.get("quotas", {}).get("cloud_download", {})
+        real_usage = int(cloud_quota.get("usage", 0))
+        real_limit = int(cloud_quota.get("limit", 5))
+        
+        # Sync DB with Real Usage
+        try:
+            from supabase_client import db
+            db.sync_quota(account_id, real_usage)
+            print(f"PIKPAK [{SERVER_ID}]: Synced quota for account {account_id}: {real_usage}/{real_limit}", flush=True)
+        except Exception as e:
+            print(f"PIKPAK [{SERVER_ID}]: Failed to sync quota: {e}", flush=True)
+            
+        result = {
+            "used_gb": used_gb,
+            "total_gb": total_gb,
+            "percent": percent,
+            "downloads_used": real_usage,
+            "downloads_limit": real_limit
+        }
         
         PIKPAK_STORAGE_CACHE[cache_key] = result
         PIKPAK_STORAGE_CACHE_TIME[cache_key] = current_time
