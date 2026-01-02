@@ -1339,7 +1339,7 @@ def admin_clear_trash(account_id):
 
 @app.route('/admin/api/clear-mypack/<int:account_id>', methods=['POST'])
 def admin_clear_mypack(account_id):
-    """Delete ALL files in the root folder (My Pack) for an account from DB"""
+    """Delete ALL files in the My Pack folder for an account from DB"""
     try:
         all_accounts = db.get_all_server_accounts(DB_SERVER_ID)
         account = next((acc for acc in all_accounts if acc['id'] == account_id), None)
@@ -1350,9 +1350,21 @@ def admin_clear_mypack(account_id):
         account['device_id'] = account.get('current_device_id')
 
         print(f"PIKPAK [{SERVER_ID}]: Clearing My Pack for account {account_id}", flush=True)
+        
+        # Invalidate cache FIRST before any operations
+        cache_key = f"account_{account_id}"
+        if cache_key in PIKPAK_STORAGE_CACHE:
+            del PIKPAK_STORAGE_CACHE[cache_key]
+        if cache_key in PIKPAK_STORAGE_CACHE_TIME:
+            del PIKPAK_STORAGE_CACHE_TIME[cache_key]
+        
         tokens = ensure_logged_in(account)
         
-        files = pikpak_list_files("root", account, tokens)
+        # Use my_pack_id if available, otherwise fall back to "root"
+        parent_id = account.get("my_pack_id") or "root"
+        print(f"PIKPAK [{SERVER_ID}]: Clearing folder: {parent_id}", flush=True)
+        
+        files = pikpak_list_files(parent_id, account, tokens)
         deleted_count = len(files)
         
         if files:
@@ -1376,7 +1388,11 @@ def admin_clear_mypack(account_id):
             body = {"ids": [f["id"] for f in files]}
             requests.post(url, headers=headers, json=body, timeout=30)
             
+            # Clear trash after moving files
             admin_clear_trash(account_id)
+        
+        # Refresh storage stats after clearing
+        get_account_storage(account)
         
         return jsonify({"success": True, "message": "My Pack cleared", "files_deleted": deleted_count})
     except Exception as e:
