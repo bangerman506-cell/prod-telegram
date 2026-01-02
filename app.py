@@ -194,13 +194,17 @@ def get_account_storage(account):
         real_usage = int(cloud_quota.get("usage", 0))
         real_limit = int(cloud_quota.get("limit", 5))
         
-        # Sync DB with Real Usage
+        # Sync DB with Real Usage + Storage Stats
         try:
-            from supabase_client import db
-            db.sync_quota(account_id, real_usage)
-            print(f"PIKPAK [{SERVER_ID}]: Synced quota for account {account_id}: {real_usage}/{real_limit}", flush=True)
+            db.sync_account_stats(
+                account_id=account_id,
+                download_usage=real_usage,
+                storage_used=used_bytes,
+                storage_limit=total_bytes
+            )
+            print(f"PIKPAK [{SERVER_ID}]: Synced ALL stats for account {account_id}: Quota={real_usage}/{real_limit}, Storage={used_gb}GB/{total_gb}GB", flush=True)
         except Exception as e:
-            print(f"PIKPAK [{SERVER_ID}]: Failed to sync quota: {e}", flush=True)
+            print(f"PIKPAK [{SERVER_ID}]: Failed to sync stats: {e}", flush=True)
             
         result = {
             "used_gb": used_gb,
