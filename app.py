@@ -557,7 +557,7 @@ def pikpak_add_magnet(magnet_link, account, tokens):
         raise Exception(f"Add magnet failed: {data.get('error', 'Unknown')}")
 
 def pikpak_poll_download(file_id, account, tokens, timeout=120, filename=None, file_hash=None):
-    """Poll until download completes with recovery"""
+    """Poll until download completes with recovery. Returns the final file_id."""
     print(f"PIKPAK [{SERVER_ID}]: Polling download for {file_id} ({filename})", flush=True)
     
     device_id = account["device_id"]
@@ -567,6 +567,7 @@ def pikpak_poll_download(file_id, account, tokens, timeout=120, filename=None, f
     start_time = time.time()
     poll_interval = 5
     last_recovery_time = time.time()
+    original_file_id = file_id
     
     while time.time() - start_time < timeout:
         if EMERGENCY_STOP:
@@ -632,8 +633,10 @@ def pikpak_poll_download(file_id, account, tokens, timeout=120, filename=None, f
                             phase = found_file.get("phase", "")
                             
                             if phase == "PHASE_TYPE_COMPLETE":
-                                print(f"PIKPAK [{SERVER_ID}]: ✅ Recovered file is already complete!", flush=True)
-                                return True
+                                print(f"PIKPAK [{SERVER_ID}]: ✅ Download complete! (Found via recovery)", flush=True)
+                                if new_file_id != original_file_id:
+                                    print(f"PIKPAK [{SERVER_ID}]: ID switched from {original_file_id} to {new_file_id}", flush=True)
+                                return new_file_id
                             
                             if new_file_id and new_file_id != file_id:
                                 print(f"PIKPAK [{SERVER_ID}]: Recovery: Switched polling from {file_id} to {new_file_id}", flush=True)
@@ -654,7 +657,9 @@ def pikpak_poll_download(file_id, account, tokens, timeout=120, filename=None, f
             # Robust completion check
             if phase == "PHASE_TYPE_COMPLETE" or data.get('progress') == 100:
                 print(f"PIKPAK [{SERVER_ID}]: ✅ Download complete! (Phase: {phase}, Progress: {progress}%)", flush=True)
-                return True
+                if file_id != original_file_id:
+                     print(f"PIKPAK [{SERVER_ID}]: ID switched from {original_file_id} to {file_id}", flush=True)
+                return file_id
             elif phase == "PHASE_TYPE_ERROR":
                 raise Exception(f"Download failed: {data.get('message', 'Unknown error')}")
             else:
@@ -1925,14 +1930,15 @@ def add_magnet():
                 # 3. Proceed with normal download
                 print(f"PIKPAK [{SERVER_ID}]: No duplicate found. Proceeding to add magnet.", flush=True)
                 task = pikpak_add_magnet(magnet, account, tokens)
-                folder_id = task.get("file_id")
+                initial_folder_id = task.get("file_id")
                 file_name = task.get("file_name", "Unknown")
                 file_hash = extract_hash(magnet)
                 
-                if not folder_id or str(folder_id).strip() == "":
+                if not initial_folder_id or str(initial_folder_id).strip() == "":
                     return jsonify({"error": "PikPak returned empty file_id", "retry": False, "server": SERVER_ID}), 400
                 
-                pikpak_poll_download(folder_id, account, tokens, timeout=900, filename=file_name, file_hash=file_hash)
+                # Poll for download and get the FINAL file/folder ID
+                folder_id = pikpak_poll_download(initial_folder_id, account, tokens, timeout=900, filename=file_name, file_hash=file_hash)
                 
                 tokens = ensure_logged_in(account)
                 file_info = pikpak_get_file_info(folder_id, account, tokens)
