@@ -2088,6 +2088,7 @@ def add_magnet():
                     "file_name": cached_file.get('file_name', 'Unknown'),
                     "file_size": cached_file.get('file_size', 0),
                     "url": download_url,
+                    "file_id": pikpak_file_id,
                     "account_used": cached_file['account_id'],
                     "server": SERVER_ID,
                     "cached": True
