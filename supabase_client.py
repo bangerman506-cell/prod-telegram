@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 # Load environment variables
 load_dotenv()
@@ -168,6 +168,536 @@ class SupabaseDB:
             
         except Exception as e:
             print(f"❌ DB Error (sync_account_stats): {e}")
+            return False
+
+    # ============================================
+    # GOFILE UPLOAD METHODS
+    # ============================================
+
+    def add_gofile_upload(self, data: Dict) -> Optional[Dict]:
+        """
+        Insert a new Gofile upload record.
+        
+        Required in data: file_id, server
+        Optional: folder_id, folder_code, file_name, file_size, 
+                  movie_name, quality, direct_link, pikpak_file_id
+        """
+        try:
+            response = self.client.table('gofile_uploads').insert({
+                'file_id': data['file_id'],
+                'server': data['server'],
+                'folder_id': data.get('folder_id'),
+                'folder_code': data.get('folder_code'),
+                'file_name': data.get('file_name'),
+                'file_size': data.get('file_size'),
+                'movie_name': data.get('movie_name'),
+                'quality': data.get('quality'),
+                'direct_link': data.get('direct_link'),
+                'pikpak_file_id': data.get('pikpak_file_id')
+            }).execute()
+            
+            print(f"✅ Gofile recorded: {data.get('file_name', data['file_id'])}")
+            return response.data[0] if response.data else None
+            
+        except Exception as e:
+            print(f"❌ DB Error (add_gofile_upload): {e}")
+            return None
+
+    def get_active_gofile_uploads(self) -> list:
+        """
+        Get all active Gofile uploads.
+        """
+        try:
+            response = self.client.table('gofile_uploads')\
+                .select('*')\
+                .eq('status', 'active')\
+                .order('created_at', desc=True)\
+                .execute()
+            
+            return response.data or []
+            
+        except Exception as e:
+            print(f"❌ DB Error (get_active_gofile_uploads): {e}")
+            return []
+
+    def update_gofile_keep_alive(self, file_id: str, status: str = None, server: str = None) -> bool:
+        """
+        Update Gofile record: timestamp always updated, status/server optional.
+        
+        Args:
+            file_id: Gofile content ID
+            status: Optional - 'active', 'expired', 'deleted'
+            server: Optional - new server if migrated
+        """
+        try:
+            update_data = {
+                'last_keep_alive': datetime.now(timezone.utc).isoformat()
+            }
+            
+            if status is not None:
+                update_data['status'] = status
+            
+            if server is not None:
+                update_data['server'] = server
+            
+            self.client.table('gofile_uploads')\
+                .update(update_data)\
+                .eq('file_id', file_id)\
+                .execute()
+            
+            print(f"🔄 Gofile updated: {file_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (update_gofile_keep_alive): {e}")
+            return False
+
+    def mark_gofile_upload_as_expired(self, file_id: str) -> bool:
+        """
+        Marks a Gofile upload as 'expired'.
+        """
+        try:
+            self.client.table('gofile_uploads').update({
+                'status': 'expired',
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }).eq('file_id', file_id).execute()
+            
+            print(f"🔄 Gofile status set to EXPIRED for: {file_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (mark_gofile_upload_as_expired): {e}")
+            return False
+
+    def get_gofile_by_file_id(self, file_id: str) -> Optional[Dict]:
+        """
+        Get single Gofile record by file_id.
+        """
+        try:
+            response = self.client.table('gofile_uploads')\
+                .select('*')\
+                .eq('file_id', file_id)\
+                .limit(1)\
+                .execute()
+            
+            return response.data[0] if response.data else None
+            
+        except Exception as e:
+            print(f"❌ DB Error (get_gofile_by_file_id): {e}")
+            return None
+
+    # ============================================
+    # SMART CACHE METHODS (PikPak Deduplication)
+    # ============================================
+
+    def check_smart_cache(self, magnet_hash: str) -> Optional[Dict]:
+        """
+        Check if file exists in any account's cache.
+        
+        Args:
+            magnet_hash: The info_hash extracted from magnet link
+            
+        Returns:
+            Dict with account_id, file_id, file_name if found, else None
+        """
+        try:
+            response = self.client.table('pikpak_files')\
+                .select('*')\
+                .eq('magnet_hash', magnet_hash)\
+                .eq('is_trash', False)\
+                .limit(1)\
+                .execute()
+            
+            if response.data and len(response.data) > 0:
+                print(f"✅ Smart Cache HIT: {response.data[0].get('file_name', 'Unknown')}")
+                return response.data[0]
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ DB Error (check_smart_cache): {e}")
+            return None
+
+    def save_to_smart_cache(self, data: Dict) -> Optional[Dict]:
+        """
+        Save file to smart cache after successful download.
+        Uses UPSERT to handle duplicates gracefully.
+        
+        Required in data: magnet_hash, file_id, account_id
+        Optional: file_hash, file_name, file_size, parent_id
+        """
+        try:
+            record = {
+                'magnet_hash': data['magnet_hash'],
+                'file_id': data['file_id'],
+                'account_id': data['account_id'],
+                'file_hash': data.get('file_hash'),
+                'file_name': data.get('file_name'),
+                'file_size': data.get('file_size'),
+                'parent_id': data.get('parent_id'),
+                'is_trash': False,
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            response = self.client.table('pikpak_files')\
+                .upsert(record, on_conflict='magnet_hash,account_id,file_id')\
+                .execute()
+            
+            print(f"💾 Smart Cache saved: {data.get('file_name', data['file_id'])}")
+            return response.data[0] if response.data else None
+            
+        except Exception as e:
+            print(f"❌ DB Error (save_to_smart_cache): {e}")
+            return None
+
+    def mark_cache_as_trash(self, account_id: int, file_ids: List[str]) -> bool:
+        """
+        Mark files as trashed (soft delete) in smart cache.
+        Called when files are deleted from PikPak.
+        
+        Args:
+            account_id: The account that had these files
+            file_ids: List of PikPak file IDs to mark as trash
+        """
+        if not file_ids:
+            return True
+            
+        try:
+            self.client.table('pikpak_files')\
+                .update({
+                    'is_trash': True,
+                    'updated_at': datetime.now(timezone.utc).isoformat()
+                })\
+                .eq('account_id', account_id)\
+                .in_('file_id', file_ids)\
+                .execute()
+            
+            print(f"🗑️ Smart Cache: Marked {len(file_ids)} files as trash for Account {account_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (mark_cache_as_trash): {e}")
+            return False
+
+    def get_cached_files_by_account(self, account_id: int) -> List[str]:
+        """
+        Get all cached file_ids for an account.
+        Used during sync to detect deleted files.
+        
+        Args:
+            account_id: The account to query
+            
+        Returns:
+            List of file_id strings
+        """
+        try:
+            response = self.client.table('pikpak_files')\
+                .select('file_id')\
+                .eq('account_id', account_id)\
+                .eq('is_trash', False)\
+                .execute()
+            
+            return [row['file_id'] for row in (response.data or [])]
+            
+        except Exception as e:
+            print(f"❌ DB Error (get_cached_files_by_account): {e}")
+            return []
+
+    def bulk_upsert_cache(self, files: List[Dict]) -> bool:
+        """
+        Bulk upsert multiple files at once.
+        More efficient for sync operations.
+        
+        Args:
+            files: List of dicts with magnet_hash, file_id, account_id, etc.
+        """
+        if not files:
+            return True
+            
+        try:
+            # Add timestamp to all records
+            for f in files:
+                f['updated_at'] = datetime.now(timezone.utc).isoformat()
+                if 'is_trash' not in f:
+                    f['is_trash'] = False
+            
+            self.client.table('pikpak_files')\
+                .upsert(files, on_conflict='magnet_hash,account_id,file_id')\
+                .execute()
+            
+            print(f"💾 Smart Cache: Bulk upserted {len(files)} files")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (bulk_upsert_cache): {e}")
+            return False
+
+    def get_smart_cache_stats(self) -> Dict:
+        """
+        Get statistics about the smart cache.
+        Useful for admin dashboard.
+        """
+        try:
+            # Total cached files
+            total = self.client.table('pikpak_files')\
+                .select('id', count='exact')\
+                .eq('is_trash', False)\
+                .execute()
+            
+            # Trashed files
+            trashed = self.client.table('pikpak_files')\
+                .select('id', count='exact')\
+                .eq('is_trash', True)\
+                .execute()
+            
+            return {
+                'active_files': total.count or 0,
+                'trashed_files': trashed.count or 0,
+                'total_files': (total.count or 0) + (trashed.count or 0)
+            }
+            
+        except Exception as e:
+            print(f"❌ DB Error (get_smart_cache_stats): {e}")
+            return {'active_files': 0, 'trashed_files': 0, 'total_files': 0}
+
+    def clear_trash_from_cache(self, account_id: int = None) -> int:
+        """
+        Permanently delete trashed entries from cache.
+        
+        Args:
+            account_id: Optional - only clear for specific account
+            
+        Returns:
+            Number of records deleted
+        """
+        try:
+            query = self.client.table('pikpak_files')\
+                .delete()\
+                .eq('is_trash', True)
+            
+            if account_id:
+                query = query.eq('account_id', account_id)
+            
+            response = query.execute()
+            count = len(response.data) if response.data else 0
+            
+            print(f"🧹 Smart Cache: Permanently deleted {count} trashed entries")
+            return count
+            
+        except Exception as e:
+            print(f"❌ DB Error (clear_trash_from_cache): {e}")
+            return 0
+
+    # ============================================
+    # INDEX MESSAGES METHODS (Dual Channel Tracker)
+    # ============================================
+
+    def _map_letter_to_group(self, letter: str) -> str:
+        """
+        Maps a single character to its letter group.
+        
+        Args:
+            letter: First character of movie name
+            
+        Returns:
+            Group name (A-E, F-J, K-O, P-T, U-Z, 0-9)
+        """
+        if not letter:
+            return '0-9'
+        
+        char = letter[0].upper()
+        
+        if char in 'ABCDE':
+            return 'A-E'
+        elif char in 'FGHIJ':
+            return 'F-J'
+        elif char in 'KLMNO':
+            return 'K-O'
+        elif char in 'PQRST':
+            return 'P-T'
+        elif char in 'UVWXYZ':
+            return 'U-Z'
+        else:
+            # Numbers, symbols, special characters
+            return '0-9'
+
+    def get_index_group(self, letter: str) -> Optional[Dict]:
+        """
+        Get index group row by first letter of movie name.
+        
+        Args:
+            letter: First character of movie name (e.g., 'A', 'T', '2')
+            
+        Returns:
+            Dict with letter_group, storage_msg_id, main_msg_id, content_text
+            None if not found
+        """
+        try:
+            group_name = self._map_letter_to_group(letter)
+            
+            response = self.client.table('index_messages')\
+                .select('*')\
+                .eq('letter_group', group_name)\
+                .limit(1)\
+                .execute()
+            
+            if response.data and len(response.data) > 0:
+                return response.data[0]
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ DB Error (get_index_group): {e}")
+            return None
+
+    def get_all_index_groups(self) -> List[Dict]:
+        """
+        Get all index group rows.
+        Useful for displaying all groups or bulk operations.
+        
+        Returns:
+            List of all index group dicts
+        """
+        try:
+            response = self.client.table('index_messages')\
+                .select('*')\
+                .order('id', desc=False)\
+                .execute()
+            
+            return response.data or []
+            
+        except Exception as e:
+            print(f"❌ DB Error (get_all_index_groups): {e}")
+            return []
+
+    def update_index_content(self, group: str, new_content: str) -> bool:
+        """
+        Update the content_text for an index group.
+        
+        Args:
+            group: Group name (A-E, F-J, K-O, P-T, U-Z, 0-9)
+            new_content: New markdown content string
+            
+        Returns:
+            True if updated, False if error
+        """
+        try:
+            self.client.table('index_messages')\
+                .update({
+                    'content_text': new_content,
+                    'updated_at': datetime.now(timezone.utc).isoformat()
+                })\
+                .eq('letter_group', group)\
+                .execute()
+            
+            print(f"✅ Index updated: {group}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (update_index_content): {e}")
+            return False
+
+    def set_index_message_ids(self, group: str, storage_msg_id: int = None, main_msg_id: int = None) -> bool:
+        """
+        Set the Telegram message IDs for an index group.
+        Call this during initial setup after creating placeholder messages.
+        
+        Args:
+            group: Group name (A-E, F-J, K-O, P-T, U-Z, 0-9)
+            storage_msg_id: Message ID in Storage Channel
+            main_msg_id: Message ID in Main/Index Channel
+            
+        Returns:
+            True if updated, False if error
+        """
+        try:
+            update_data = {
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            if storage_msg_id is not None:
+                update_data['storage_msg_id'] = storage_msg_id
+            
+            if main_msg_id is not None:
+                update_data['main_msg_id'] = main_msg_id
+            
+            self.client.table('index_messages')\
+                .update(update_data)\
+                .eq('letter_group', group)\
+                .execute()
+            
+            print(f"✅ Message IDs set for {group}: storage={storage_msg_id}, main={main_msg_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (set_index_message_ids): {e}")
+            return False
+
+    def append_to_index(self, movie_name: str, link: str) -> bool:
+        """
+        Append a new movie entry to the appropriate index group.
+        Automatically determines group from movie name.
+        
+        Args:
+            movie_name: Name of the movie
+            link: Telegram link to the movie post
+            
+        Returns:
+            True if appended, False if error
+        """
+        try:
+            # Get first letter and find group
+            first_letter = movie_name[0] if movie_name else '0'
+            group_data = self.get_index_group(first_letter)
+            
+            if not group_data:
+                print(f"❌ Could not find group for: {movie_name}")
+                return False
+            
+            group_name = group_data['letter_group']
+            current_content = group_data.get('content_text', '') or ''
+            
+            # Create new entry in markdown format
+            new_entry = f"• [{movie_name}]({link})"
+            
+            # Append to existing content
+            if current_content.strip():
+                updated_content = f"{current_content}\n{new_entry}"
+            else:
+                updated_content = new_entry
+            
+            # Update in database
+            return self.update_index_content(group_name, updated_content)
+            
+        except Exception as e:
+            print(f"❌ DB Error (append_to_index): {e}")
+            return False
+
+    def initialize_index_rows(self) -> bool:
+        """
+        Initialize the 6 default index groups if they don't exist.
+        Safe to call multiple times (uses upsert).
+        
+        Returns:
+            True if successful, False if error
+        """
+        try:
+            groups = ['A-E', 'F-J', 'K-O', 'P-T', 'U-Z', '0-9']
+            
+            for group in groups:
+                self.client.table('index_messages')\
+                    .upsert({
+                        'letter_group': group,
+                        'content_text': '',
+                        'updated_at': datetime.now(timezone.utc).isoformat()
+                    }, on_conflict='letter_group')\
+                    .execute()
+            
+            print(f"✅ Initialized {len(groups)} index groups")
+            return True
+            
+        except Exception as e:
+            print(f"❌ DB Error (initialize_index_rows): {e}")
             return False
 
 # Singleton instance

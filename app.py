@@ -8,13 +8,22 @@ import time
 import re
 import json
 import hashlib
+import time
+import random
 from datetime import datetime, timedelta
 from io import IOBase
 from urllib.parse import unquote
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from pyrogram import Client, enums
-from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired
+from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired, MessageNotModified
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import gofile_client
+from smart_cache import (
+    check_smart_cache,
+    save_to_smart_cache,
+    sync_all_accounts_to_cache,
+    get_cache_stats
+)
 
 app = Flask(__name__)
 
@@ -248,6 +257,10 @@ def check_all_accounts_quota():
                 print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Storage: {storage['used_gb']}GB/{storage['total_gb']}GB ({storage['percent']}%)", flush=True)
                 print(f"PIKPAK [{SERVER_ID}]: Account {account['id']} - Login successful ✅", flush=True)
                 
+                delay = random.uniform(2, 5)
+                print(f"Startup: Waiting {delay:.1f}s...", flush=True)
+                time.sleep(delay)
+                
             except Exception as e:
                 print(f"PIKPAK [{SERVER_ID}]: Account {account.get('id', 'N/A')} - Check failed: {e}", flush=True)
     
@@ -271,6 +284,17 @@ def save_pikpak_tokens(tokens):
             json.dump(tokens, f)
     except Exception as e:
         print(f"PIKPAK [{SERVER_ID}]: Failed to save tokens: {e}", flush=True)
+
+def get_captcha_for_sync(action, device_id, user_id):
+    """Helper to generate captcha token for smart_cache sync"""
+    captcha_sign, timestamp = generate_captcha_sign(device_id)
+    return get_pikpak_captcha(
+        action=action,
+        device_id=device_id,
+        user_id=user_id,
+        captcha_sign=captcha_sign,
+        timestamp=timestamp
+    )
 
 def get_account_tokens(account_id):
     """Get tokens for specific account"""
@@ -347,9 +371,15 @@ def get_pikpak_captcha(action, device_id, user_id=None, captcha_sign=None, times
         print(f"PIKPAK [{SERVER_ID}]: Captcha request failed: {e}", flush=True)
         raise
 
-def pikpak_login(account):
-    """Login to PikPak account"""
-    print(f"PIKPAK [{SERVER_ID}]: Logging in account {account['id']} ({account['email']})", flush=True)
+def pikpak_login(account, retry_count=0):
+    """Login to PikPak account with device rotation retry"""
+    # Sleep 1-5 seconds to desynchronize workers
+    time.sleep(random.uniform(1, 5))
+
+    if retry_count >= 3:
+        raise Exception(f"Login failed for account {account['id']} after multiple device rotations.")
+
+    print(f"PIKPAK [{SERVER_ID}]: Logging in account {account['id']} ({account['email']}) | Attempt #{retry_count + 1}", flush=True)
     
     device_id = account["device_id"]
     email = account["email"]
@@ -378,7 +408,37 @@ def pikpak_login(account):
     
     response = requests.post(url, headers=headers, json=body, timeout=30)
     data = response.json()
+
+    # Check for device/captcha errors that require device rotation
+    error_code = data.get('error_code')
+    error_str = data.get('error')
     
+    DEVICE_ERROR_CODES = [4002, 1005, 'captcha_invalid', 'captcha_required', 'device_blocked']
+    
+    is_device_error = False
+    # Handle both integer and string error codes
+    if error_code is not None and error_code in DEVICE_ERROR_CODES:
+        is_device_error = True
+    elif error_str is not None and error_str in DEVICE_ERROR_CODES:
+        is_device_error = True
+
+    if is_device_error:
+        print(f"PIKPAK [{SERVER_ID}]: ⚠️ Device flagged for account {account['id']} (error: {error_code or error_str}). Rotating device...", flush=True)
+        log_activity("warning", f"Device flagged for Acct {account['id']}. Rotating.")
+        
+        try:
+            new_device_id = db.rotate_device(account['id'])
+            if not new_device_id:
+                raise Exception("db.rotate_device did not return a new device ID.")
+            
+            # Update account object and retry
+            account['device_id'] = new_device_id
+            return pikpak_login(account, retry_count=retry_count + 1)
+        except Exception as e:
+            final_error_msg = f"Device rotation failed for account {account['id']}: {e}"
+            print(f"PIKPAK [{SERVER_ID}]: ❌ {final_error_msg}", flush=True)
+            raise Exception(final_error_msg)
+
     if "access_token" in data:
         token_data = {
             "access_token": data["access_token"],
@@ -393,7 +453,7 @@ def pikpak_login(account):
         return token_data
     else:
         print(f"PIKPAK [{SERVER_ID}]: ❌ Login failed: {data}", flush=True)
-        raise Exception(f"Login failed: {data.get('error', 'Unknown')}")
+        raise Exception(f"Login failed: {data.get('error_description') or data.get('error', 'Unknown')}")
 
 def refresh_pikpak_token(account):
     """Refresh expired access_token"""
@@ -1365,6 +1425,21 @@ def admin_clear_trash(account_id):
 
         get_account_storage(account)
         
+        # Sync cache after clearing trash
+        try:
+            log_activity("info", "Trash cleared, starting cache sync.")
+            sync_thread = threading.Thread(
+                target=sync_all_accounts_to_cache,
+                kwargs={
+                    'login_func': pikpak_login, 
+                    'get_account_func': None,
+                    'captcha_func': get_captcha_for_sync
+                }
+            )
+            sync_thread.start()
+        except Exception as sync_e:
+            print(f"CACHE [{SERVER_ID}]: Failed to start sync after trash clear: {sync_e}", flush=True)
+
         return jsonify({"success": True, "message": "Trash cleared"})
     except Exception as e:
         print(f"PIKPAK [{SERVER_ID}]: Failed to clear trash for account {account_id}: {e}", flush=True)
@@ -1466,6 +1541,56 @@ def admin_clear_all_mypack():
         return jsonify({"success": False, "error": str(e)}), 500
     return jsonify({"success": True, "accounts_cleared": count})
 
+
+def _get_gofile_stats():
+    """Helper to get and calculate Gofile stats."""
+    try:
+        uploads = db.get_active_gofile_uploads()
+        if not uploads:
+            return {
+                "total_files": 0,
+                "total_size_gb": 0,
+                "last_keep_alive": "Never",
+                "recent_uploads": []
+            }
+
+        total_files = len(uploads)
+        total_size_bytes = sum(u.get('file_size', 0) or 0 for u in uploads)
+        total_size_gb = round(total_size_bytes / (1024**3), 2)
+
+        last_keep_alive = "Never"
+        if uploads:
+            # Filter out None values before finding the max
+            keep_alive_dates = [u.get('last_keep_alive') for u in uploads if u.get('last_keep_alive')]
+            if keep_alive_dates:
+                last_keep_alive = max(keep_alive_dates)
+
+        # Get last 5 active uploads, sorted by creation time
+        recent_uploads = sorted(uploads, key=lambda u: u.get('created_at'), reverse=True)[:5]
+        recent_uploads_list = [
+            {
+                "filename": u.get('filename', 'N/A'),
+                "size": f"{round((u.get('file_size', 0) or 0) / (1024**2), 1)} MB",
+                "link": u.get('url', '#')
+            }
+            for u in recent_uploads
+        ]
+
+        return {
+            "total_files": total_files,
+            "total_size_gb": total_size_gb,
+            "last_keep_alive": last_keep_alive,
+            "recent_uploads": recent_uploads_list
+        }
+    except Exception as e:
+        print(f"Error getting Gofile stats: {e}")
+        return {
+            "total_files": 0,
+            "total_size_gb": 0,
+            "last_keep_alive": "Error",
+            "recent_uploads": []
+        }
+
 @app.route('/admin/api/status')
 def admin_api_status():
     """Get complete admin dashboard data from the database"""
@@ -1527,6 +1652,8 @@ def admin_api_status():
             total_data = f"{total_mb/1024:.1f} GB"
         else:
             total_data = f"{total_mb:.0f} MB"
+
+    gofile_stats = _get_gofile_stats()
     
     return jsonify({
         "server": {
@@ -1550,6 +1677,7 @@ def admin_api_status():
             "list": accounts_list,
             "total_remaining": total_remaining
         },
+        "gofile": gofile_stats,
         "sessions": sessions_list,
         "report": {
             "downloads": DAILY_STATS["downloads"],
@@ -1572,6 +1700,35 @@ def admin_reset_quota(account_id):
             return jsonify({"success": False, "error": "DB operation failed"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/admin/api/sync-cache', methods=['POST'])
+def admin_sync_cache():
+    """Sync all PikPak accounts to the smart cache"""
+    try:
+        # This can be a long-running process, so maybe run in a thread
+        sync_thread = threading.Thread(
+            target=sync_all_accounts_to_cache,
+            kwargs={
+                'login_func': pikpak_login, 
+                'get_account_func': None,
+                'captcha_func': get_captcha_for_sync
+            }
+        )
+        sync_thread.start()
+        log_activity("info", "Started full cache sync.")
+        return jsonify({"success": True, "message": "Cache sync started in background."})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/admin/api/cache-stats', methods=['GET'])
+def admin_cache_stats():
+    """Get statistics for the smart cache"""
+    try:
+        stats = get_cache_stats()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 # ============================================================
 # FLASK ROUTES
@@ -1897,6 +2054,50 @@ def add_magnet():
         
         if not magnet:
             return jsonify({"error": "Missing magnet parameter"}), 400
+
+        # Smart Cache Check
+        cached_file = check_smart_cache(magnet)
+        if cached_file:
+            print(f"CACHE [{SERVER_ID}]: ✅ Hit for magnet. Generating fresh link.", flush=True)
+            log_activity("success", f"Cache Hit: {cached_file.get('file_name', 'Unknown')}")
+            try:
+                # 1. Get account details from DB
+                account_id = cached_file['account_id']
+                
+                # Fetch account details directly from Supabase
+                acc_response = db.client.table('accounts').select('*').eq('id', account_id).limit(1).execute()
+                account = acc_response.data[0] if (acc_response.data and len(acc_response.data) > 0) else None
+                
+                if not account:
+                    raise Exception(f"Account {account_id} for cached file not found in DB.")
+
+                # Map device_id for compatibility, which is needed for login
+                account['device_id'] = account.get('current_device_id')
+                if not account['device_id']:
+                     raise Exception(f"Account {account_id} has no device_id.")
+
+                # 2. Login to the account to get fresh tokens
+                tokens = ensure_logged_in(account)
+
+                # 3. Generate a fresh download link
+                pikpak_file_id = cached_file['file_id']
+                download_url = pikpak_get_download_link(pikpak_file_id, account, tokens)
+
+                return jsonify({
+                    "result": True,
+                    "file_name": cached_file.get('file_name', 'Unknown'),
+                    "file_size": cached_file.get('file_size', 0),
+                    "url": download_url,
+                    "account_used": cached_file['account_id'],
+                    "server": SERVER_ID,
+                    "cached": True
+                })
+            except Exception as e:
+                print(f"CACHE [{SERVER_ID}]: ❌ Failed to process cache hit: {e}", flush=True)
+                log_activity("error", f"Cache hit processing failed: {e}")
+                # Return an error instead of falling through to a normal download
+                return jsonify({"error": f"Failed to retrieve cached file link: {str(e)}", "retry": False, "server": SERVER_ID}), 500
+
         
         exhausted_accounts = []
         max_total_retries = 8
@@ -1964,11 +2165,6 @@ def add_magnet():
                         download_url = pikpak_get_download_link(folder_id, account, tokens)
                 
                 file_size = int(video_file.get("size", 0))
-                file_size_mb = file_size / 1024 / 1024
-                
-                if file_size_mb > 2048:
-                    return jsonify({"error": f"File too large: {file_size_mb:.0f}MB", "retry": False, "server": SERVER_ID}), 400
-                
                 # SUCCESS: Increment quota in DB
                 db.increment_quota(account["id"])
                 
@@ -1977,6 +2173,18 @@ def add_magnet():
                 print(f"PIKPAK [{SERVER_ID}]: === ADD MAGNET SUCCESS ===", flush=True)
                 log_activity("success", f"Downloaded: {video_file.get('name', file_name)}")
                 update_daily_stats("downloads")
+
+                # Save to Smart Cache (Corrected)
+                try:
+                    save_to_smart_cache(
+                        file_id=video_file.get("id", folder_id),
+                        account_id=account["id"],
+                        magnet_link=magnet,
+                        file_name=video_file.get("name", file_name),
+                        file_size=file_size
+                    )
+                except Exception as e:
+                    print(f"CACHE: Failed to save to smart cache: {e}", flush=True)
                 
                 return jsonify({
                     "result": True,
@@ -2210,6 +2418,298 @@ cleanup_thread.start()
 # ============================================================
 # MAIN
 # ============================================================
+
+# ============================================================
+# GOFILE INTEGRATION (LIGHTWEIGHT)
+# ============================================================
+
+@app.route('/save-gofile-result', methods=['POST'])
+def save_gofile_result():
+    """Save Gofile upload result from external service to DB"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data"}), 400
+            
+        # Required field
+        if not data.get('file_id'):
+            return jsonify({"success": False, "error": "Missing file_id"}), 400
+        
+        # Defaults
+        if 'server' not in data:
+            data['server'] = 'global'
+            
+        # Smart fallback for download page
+        # If download_page missing, try to construct it from folder_code
+        if not data.get('download_page') and data.get('folder_code'):
+            data['download_page'] = f"https://gofile.io/d/{data['folder_code']}"
+            
+        # Call DB
+        result = db.add_gofile_upload(data)
+        
+        if result:
+            print(f"DB: Saved Gofile upload {data.get('file_id')}")
+            return jsonify({"success": True})
+        else:
+            print(f"DB: Failed to save Gofile upload {data.get('file_id')}")
+            return jsonify({"success": False, "error": "DB insert failed"}), 500
+            
+    except Exception as e:
+        print(f"DB ERROR: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/gofile/status', methods=['GET'])
+def gofile_status_list():
+    """Get active Gofile uploads for dashboard"""
+    try:
+        active_files = db.get_active_gofile_uploads()
+        return jsonify({
+            "success": True,
+            "count": len(active_files),
+            "uploads": active_files
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+
+@app.route('/gofile/keep-alive', methods=['POST'])
+def gofile_keep_alive():
+    """Scheduled job to keep Gofile links alive with throttling."""
+    print("GOFILE: Starting keep-alive job...", flush=True)
+    
+    files = []
+    success_count = 0
+    failed_count = 0
+
+    try:
+        files = db.get_active_gofile_uploads()
+        if not files:
+            print("GOFILE: No active files to keep alive.", flush=True)
+            return {
+                "success": True,
+                "processed": 0,
+                "kept_alive": 0,
+                "failed": 0,
+                "message": "No active files to keep alive."
+            }
+
+        print(f"GOFILE: Found {len(files)} files to process", flush=True)
+
+        proxy_url = "https://bangerman111-myfiles.hf.space/check-file"
+        api_key = "mufiles-321"
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": api_key
+        }
+
+        for index, file in enumerate(files):
+            file_id = file.get('file_id')
+            folder_code = file.get('folder_code')
+            server = file.get('server')
+            filename = file.get('file_name')
+
+            if not file_id or not folder_code:
+                print(f"GOFILE: Skipping file with missing file_id or folder_code. DB Record ID: {file.get('id')}", flush=True)
+                failed_count += 1
+                continue
+
+            print(f"GOFILE: [{index + 1}/{len(files)}] Processing file_id={file_id}", flush=True)
+
+            payload = {
+                "file_id": file_id,
+                "folder_code": folder_code,
+                "server": server,
+                "file_name": filename
+            }
+
+            try:
+                response = requests.post(proxy_url, headers=headers, json=payload, timeout=45)
+                response.raise_for_status()
+                
+                status_data = response.json()
+                status = status_data.get('status')
+
+                # Check for server migration
+                new_server = status_data.get('new_server')
+                server_updated = False
+                if new_server and new_server != server:
+                    db.update_gofile_keep_alive(file_id, server=new_server)
+                    print(f"GOFILE: Updated server for {file_id} to {new_server}", flush=True)
+                    server_updated = True
+
+                if status == 'alive':
+                    if not server_updated:
+                        db.update_gofile_keep_alive(file_id)
+                    success_count += 1
+                    print(f"GOFILE: ✅ Successfully kept alive: {file_id}", flush=True)
+                
+                elif status == 'missing':
+                    print(f"GOFILE: ❌ File missing, marking as expired: {file_id}", flush=True)
+                    db.update_gofile_keep_alive(file_id, status='expired')
+                    failed_count += 1
+
+                elif status == 'error':
+                    error_message = status_data.get('message', 'No message provided.')
+                    print(f"GOFILE: ⚠️ Proxy error for {file_id}: {error_message}", flush=True)
+                    failed_count += 1
+                
+                else:
+                    print(f"GOFILE: ❓ Unknown status '{status}' for {file_id}", flush=True)
+                    failed_count += 1
+
+            except requests.exceptions.Timeout:
+                print(f"GOFILE: ⏱️ Timeout checking status for {file_id}", flush=True)
+                failed_count += 1
+            except requests.exceptions.RequestException as e:
+                print(f"GOFILE: 🔴 Request failed for {file_id}: {e}", flush=True)
+                failed_count += 1
+            except json.JSONDecodeError:
+                print(f"GOFILE: 🔴 Failed to decode JSON response for {file_id}", flush=True)
+                failed_count += 1
+            
+            # ============================================================
+            # THROTTLING: Add delay between requests (except after last file)
+            # ============================================================
+            if index < len(files) - 1:
+                delay = random.randint(3, 7)
+                print(f"GOFILE: 💤 Waiting {delay}s before next request...", flush=True)
+                time.sleep(delay)
+        
+        print(f"GOFILE: ✅ Keep-alive job finished. Success: {success_count}, Failed: {failed_count}", flush=True)
+        
+        return {
+            "success": True,
+            "processed": len(files),
+            "kept_alive": success_count,
+            "failed": failed_count
+        }
+
+    except Exception as e:
+        print(f"GOFILE: 🔴 An unexpected error occurred in keep-alive job: {e}", flush=True)
+        return {
+            "success": False, 
+            "error": str(e),
+            "processed": len(files),
+            "kept_alive": success_count,
+            "failed": failed_count
+        }
+    
+@app.route('/update-index', methods=['POST'])
+def update_index():
+    """Update Telegram Index Channel with new movie"""
+    try:
+        data = request.json
+        movie_name = data.get('movie_name')
+        poster_link = data.get('poster_link')
+        year = data.get('year')
+        
+        if not movie_name or not poster_link:
+            return jsonify({"error": "Missing movie_name or poster_link"}), 400
+            
+        # 1. Determine Group
+        first_letter = movie_name[0].upper()
+        
+        # 2. Fetch DB Group
+        # get_index_group handles the mapping from letter -> group name
+        group_data = db.get_index_group(first_letter)
+        
+        if not group_data:
+            # Auto-initialize if missing
+            db.initialize_index_rows()
+            group_data = db.get_index_group(first_letter)
+            if not group_data:
+                return jsonify({"error": "Index group not found"}), 404
+        
+        group_name = group_data['letter_group']
+        current_content = group_data.get('content_text', '') or ''
+        
+        # 3. Parse & Add Entry
+        lines = [line.strip() for line in current_content.split('\n') if line.strip()]
+        
+        display_name = f"{movie_name} ({year})" if year else movie_name
+        new_entry = f"• [{display_name}]({poster_link})"
+        
+        # Check for duplicates
+        if new_entry in lines:
+            print(f"INDEX: Entry already exists for {movie_name}", flush=True)
+            return jsonify({"success": True, "message": "Entry already exists", "group": group_name})
+            
+        lines.append(new_entry)
+        
+        # 4. Sort Alphabetically (ignoring the bullet point)
+        lines.sort(key=lambda x: x.replace('• ', '').replace('[', '').lower())
+        
+        updated_content = "\n".join(lines)
+        
+        # 5. Update Telegram Messages
+        storage_msg_id = group_data.get('storage_msg_id')
+        main_msg_id = group_data.get('main_msg_id')
+        
+        storage_chat_id = os.environ.get("STORAGE_CHANNEL_ID")
+        main_chat_id = os.environ.get("MAIN_CHANNEL_ID")
+        
+        async def edit_telegram_messages():
+            async with Client(
+                SESSION_NAME,
+                api_id=API_ID,
+                api_hash=API_HASH,
+                bot_token=BOT_TOKEN,
+                workdir="/tmp"
+            ) as tg_app:
+                header = f"**Index: {group_name}**\n\n"
+                full_text = header + updated_content
+                
+                # Edit Storage Channel
+                if storage_chat_id and storage_msg_id:
+                    try:
+                        await tg_app.edit_message_text(
+                            chat_id=int(storage_chat_id),
+                            message_id=int(storage_msg_id),
+                            text=full_text,
+                            disable_web_page_preview=True,
+                            parse_mode=enums.ParseMode.MARKDOWN
+                        )
+                        print(f"INDEX: Updated Storage Channel msg {storage_msg_id}", flush=True)
+                    except MessageNotModified:
+                        pass
+                    except Exception as e:
+                        print(f"INDEX ERROR (Storage): {e}", flush=True)
+                
+                # Edit Main Channel
+                if main_chat_id and main_msg_id:
+                    try:
+                        await tg_app.edit_message_text(
+                            chat_id=int(main_chat_id),
+                            message_id=int(main_msg_id),
+                            text=full_text,
+                            disable_web_page_preview=True,
+                            parse_mode=enums.ParseMode.MARKDOWN
+                        )
+                        print(f"INDEX: Updated Main Channel msg {main_msg_id}", flush=True)
+                    except MessageNotModified:
+                        pass
+                    except Exception as e:
+                        print(f"INDEX ERROR (Main): {e}", flush=True)
+
+        # Run async update
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(edit_telegram_messages())
+        loop.close()
+        
+        # 6. Save to DB
+        db.update_index_content(group_name, updated_content)
+        
+        return jsonify({
+            "success": True,
+            "group": group_name,
+            "entry": new_entry
+        })
+        
+    except Exception as e:
+        print(f"INDEX ERROR: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     print("=" * 60, flush=True)
