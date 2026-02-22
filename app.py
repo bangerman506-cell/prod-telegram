@@ -2728,6 +2728,7 @@ def admin_get_scraped_magnets():
 @app.route('/admin/api/approve-magnet/<int:magnet_id>', methods=['POST'])
 def admin_approve_magnet(magnet_id):
     """Approve and upload a scraped magnet"""
+    """Approve and upload a scraped magnet via n8n"""
     try:
         # 1. Fetch magnet from DB
         magnet_row = db.get_magnet_by_id(magnet_id)
@@ -2740,10 +2741,19 @@ def admin_approve_magnet(magnet_id):
              
         # 2. Add to PikPak (Reuse logic)
         # We use a simplified version of add_magnet logic here
+        # 2. Trigger n8n Webhook
+        n8n_webhook_url = "https://n8n-2-1-4-rlsr.onrender.com/webhook/approve-magnet"
+        payload = {
+            "url": magnet_link,
+            "chat_id": ADMIN_CHAT_ID,
+            "quality": magnet_row.get('quality', 'auto')
+        }
         
         # Get account
         account = get_best_account()
         tokens = ensure_logged_in(account)
+        print(f"APPROVE: Triggering n8n for magnet ID {magnet_id}...", flush=True)
+        response = requests.post(n8n_webhook_url, json=payload, timeout=10)
         
         # Add magnet
         task = pikpak_add_magnet(magnet_link, account, tokens)
@@ -2779,15 +2789,22 @@ def admin_approve_magnet(magnet_id):
             )
         except Exception as e:
             print(f"CACHE: Failed to save approved magnet: {e}")
+        if response.status_code != 200:
+            error_text = response.text
+            print(f"APPROVE ERROR: n8n webhook returned status {response.status_code}: {error_text}", flush=True)
+            return jsonify({"success": False, "error": f"n8n webhook failed with status {response.status_code}"}), 502
 
         # 3. Update DB status
         db.update_magnet_status(magnet_id, 'uploaded')
         db.increment_quota(account["id"])
         
         return jsonify({"success": True, "message": "Magnet approved and uploaded"})
+        print(f"APPROVE: Successfully sent magnet {magnet_id} to n8n.", flush=True)
+        return jsonify({"success": True, "message": "Magnet approved and sent to n8n"})
         
     except Exception as e:
         print(f"APPROVE ERROR: {e}")
+        print(f"APPROVE ERROR: {e}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/admin/api/reject-magnet/<int:magnet_id>', methods=['POST'])
