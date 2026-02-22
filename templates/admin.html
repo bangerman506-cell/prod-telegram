@@ -148,6 +148,29 @@
             </div>
         </section>
 
+        <!-- Scraper Queue Section -->
+        <section class="section">
+            <div class="section-header">
+                <h2 class="section-title">🤖 Scraper Queue</h2>
+                <button class="btn btn-secondary" onclick="fetchScraperQueue()">🔄 Refresh Queue</button>
+            </div>
+            <div class="table-container">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Movie Name</th>
+                            <th>Quality</th>
+                            <th>Size</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scraperTable">
+                        <!-- Populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
         <!-- Test Magnet Section -->
         <section class="section">
             <h2 class="section-title">🧪 Test Magnet</h2>
@@ -227,6 +250,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             refreshData();
             fetchCacheStats();
+            fetchScraperQueue();
         });
 
         // Time ago utility
@@ -681,6 +705,93 @@
             } catch (error) {
                 alert(`❌ Request failed: ${error.message}`);
             } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalText;
+            }
+        }
+
+        // Fetch Scraper Queue
+        async function fetchScraperQueue() {
+            try {
+                const response = await fetch('/admin/api/scraped-magnets');
+                const data = await response.json();
+                const tbody = document.getElementById('scraperTable');
+                tbody.innerHTML = '';
+                
+                if (!data || data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No pending magnets</td></tr>';
+                    return;
+                }
+
+                data.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${item.movie_name || 'Unknown'}</td>
+                        <td>${item.quality || 'Auto'}</td>
+                        <td>${item.size || '-'}</td>
+                        <td>
+                            <button class="btn btn-sm btn-success" onclick="approveMagnet(${item.id}, this)">✅ Upload</button>
+                            <button class="btn btn-sm btn-danger" onclick="rejectMagnet(${item.id}, this)">❌ Reject</button>
+                        </td>
+                    `;
+                    tbody.appendChild(row);
+                });
+            } catch (error) {
+                console.error('Error fetching scraper queue:', error);
+                document.getElementById('scraperTable').innerHTML = '<tr><td colspan="4" class="empty-state">Error loading queue</td></tr>';
+            }
+        }
+
+        // Approve Magnet
+        async function approveMagnet(id, btn) {
+            if (!confirm('Approve and upload this magnet?')) return;
+            const originalText = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '⏳';
+            
+            try {
+                const response = await fetch(`/admin/api/approve-magnet/${id}`, { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    btn.closest('tr').remove();
+                    // Check if table is empty
+                    if (document.getElementById('scraperTable').children.length === 0) {
+                        document.getElementById('scraperTable').innerHTML = '<tr><td colspan="4" class="empty-state">No pending magnets</td></tr>';
+                    }
+                } else {
+                    alert('Failed: ' + (data.error || 'Unknown error'));
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                }
+            } catch (e) {
+                alert('Error: ' + e);
+                btn.disabled = false;
+                btn.innerHTML = originalText;
+            }
+        }
+
+        // Reject Magnet
+        async function rejectMagnet(id, btn) {
+            if (!confirm('Reject this magnet?')) return;
+            const originalText = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '⏳';
+            
+            try {
+                const response = await fetch(`/admin/api/reject-magnet/${id}`, { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    btn.closest('tr').remove();
+                    if (document.getElementById('scraperTable').children.length === 0) {
+                        document.getElementById('scraperTable').innerHTML = '<tr><td colspan="4" class="empty-state">No pending magnets</td></tr>';
+                    }
+                } else {
+                    alert('Failed: ' + (data.error || 'Unknown error'));
+                    btn.disabled = false;
+                    btn.innerHTML = originalText;
+                }
+            } catch (e) {
+                alert('Error: ' + e);
                 btn.disabled = false;
                 btn.innerHTML = originalText;
             }

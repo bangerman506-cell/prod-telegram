@@ -2712,6 +2712,93 @@ def update_index():
         print(f"INDEX ERROR: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
+# ============================================================
+# SCRAPER APPROVAL ROUTES
+# ============================================================
+
+@app.route('/admin/api/scraped-magnets', methods=['GET'])
+def admin_get_scraped_magnets():
+    """Get pending scraped magnets"""
+    try:
+        magnets = db.get_pending_magnets()
+        return jsonify(magnets)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/admin/api/approve-magnet/<int:magnet_id>', methods=['POST'])
+def admin_approve_magnet(magnet_id):
+    """Approve and upload a scraped magnet"""
+    try:
+        # 1. Fetch magnet from DB
+        magnet_row = db.get_magnet_by_id(magnet_id)
+        if not magnet_row:
+            return jsonify({"success": False, "error": "Magnet not found"}), 404
+            
+        magnet_link = magnet_row.get('magnet_link')
+        if not magnet_link:
+             return jsonify({"success": False, "error": "No magnet link in record"}), 400
+             
+        # 2. Add to PikPak (Reuse logic)
+        # We use a simplified version of add_magnet logic here
+        
+        # Get account
+        account = get_best_account()
+        tokens = ensure_logged_in(account)
+        
+        # Add magnet
+        task = pikpak_add_magnet(magnet_link, account, tokens)
+        file_id = task.get("file_id")
+        file_name = task.get("file_name", "Unknown")
+        
+        if not file_id:
+             return jsonify({"success": False, "error": "Failed to add magnet to PikPak"}), 500
+             
+        # Poll for completion (Timeout 5 mins for interactive approval)
+        final_file_id = pikpak_poll_download(
+            file_id, 
+            account, 
+            tokens, 
+            timeout=300, 
+            filename=file_name,
+            file_hash=extract_hash(magnet_link)
+        )
+        
+        # Get final info
+        tokens = ensure_logged_in(account)
+        file_info = pikpak_get_file_info(final_file_id, account, tokens)
+        file_size = int(file_info.get("size", 0))
+        
+        # Save to smart cache
+        try:
+            save_to_smart_cache(
+                file_id=final_file_id,
+                account_id=account["id"],
+                magnet_link=magnet_link,
+                file_name=file_info.get("name", file_name),
+                file_size=file_size
+            )
+        except Exception as e:
+            print(f"CACHE: Failed to save approved magnet: {e}")
+
+        # 3. Update DB status
+        db.update_magnet_status(magnet_id, 'uploaded')
+        db.increment_quota(account["id"])
+        
+        return jsonify({"success": True, "message": "Magnet approved and uploaded"})
+        
+    except Exception as e:
+        print(f"APPROVE ERROR: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/admin/api/reject-magnet/<int:magnet_id>', methods=['POST'])
+def admin_reject_magnet(magnet_id):
+    """Reject a scraped magnet"""
+    try:
+        db.update_magnet_status(magnet_id, 'rejected')
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 if __name__ == '__main__':
     print("=" * 60, flush=True)
     print(f"🚀 PikPak-Telegram Bridge - SERVER: {SERVER_ID.upper()}", flush=True)

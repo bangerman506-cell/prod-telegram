@@ -700,5 +700,47 @@ class SupabaseDB:
             print(f"❌ DB Error (initialize_index_rows): {e}")
             return False
 
+    # ============================================
+    # SCRAPER QUEUE METHODS
+    # ============================================
+
+    def get_pending_magnets(self) -> List[Dict]:
+        """Fetch pending scraped magnets."""
+        try:
+            response = self.client.table('scraped_magnets')\
+                .select('*')\
+                .eq('status', 'pending')\
+                .order('created_at', desc=True)\
+                .execute()
+            return response.data or []
+        except Exception as e:
+            print(f"❌ DB Error (get_pending_magnets): {e}")
+            return []
+
+    def get_magnet_by_id(self, magnet_id: int) -> Optional[Dict]:
+        """Fetch a single magnet by ID."""
+        try:
+            response = self.client.table('scraped_magnets')\
+                .select('*')\
+                .eq('id', magnet_id)\
+                .limit(1)\
+                .execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            print(f"❌ DB Error (get_magnet_by_id): {e}")
+            return None
+
+    def update_magnet_status(self, magnet_id: int, status: str) -> bool:
+        """Update status of a scraped magnet."""
+        try:
+            self.client.table('scraped_magnets')\
+                .update({'status': status, 'updated_at': datetime.now(timezone.utc).isoformat()})\
+                .eq('id', magnet_id)\
+                .execute()
+            return True
+        except Exception as e:
+            print(f"❌ DB Error (update_magnet_status): {e}")
+            return False
+
 # Singleton instance
 db = SupabaseDB()
