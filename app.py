@@ -2727,7 +2727,6 @@ def admin_get_scraped_magnets():
 
 @app.route('/admin/api/approve-magnet/<int:magnet_id>', methods=['POST'])
 def admin_approve_magnet(magnet_id):
-    """Approve and upload a scraped magnet"""
     """Approve and upload a scraped magnet via n8n"""
     try:
         # 1. Fetch magnet from DB
@@ -2739,8 +2738,6 @@ def admin_approve_magnet(magnet_id):
         if not magnet_link:
              return jsonify({"success": False, "error": "No magnet link in record"}), 400
              
-        # 2. Add to PikPak (Reuse logic)
-        # We use a simplified version of add_magnet logic here
         # 2. Trigger n8n Webhook
         n8n_webhook_url = "https://n8n-2-1-4-rlsr.onrender.com/webhook/approve-magnet"
         payload = {
@@ -2749,46 +2746,9 @@ def admin_approve_magnet(magnet_id):
             "quality": magnet_row.get('quality', 'auto')
         }
         
-        # Get account
-        account = get_best_account()
-        tokens = ensure_logged_in(account)
         print(f"APPROVE: Triggering n8n for magnet ID {magnet_id}...", flush=True)
         response = requests.post(n8n_webhook_url, json=payload, timeout=10)
         
-        # Add magnet
-        task = pikpak_add_magnet(magnet_link, account, tokens)
-        file_id = task.get("file_id")
-        file_name = task.get("file_name", "Unknown")
-        
-        if not file_id:
-             return jsonify({"success": False, "error": "Failed to add magnet to PikPak"}), 500
-             
-        # Poll for completion (Timeout 5 mins for interactive approval)
-        final_file_id = pikpak_poll_download(
-            file_id, 
-            account, 
-            tokens, 
-            timeout=300, 
-            filename=file_name,
-            file_hash=extract_hash(magnet_link)
-        )
-        
-        # Get final info
-        tokens = ensure_logged_in(account)
-        file_info = pikpak_get_file_info(final_file_id, account, tokens)
-        file_size = int(file_info.get("size", 0))
-        
-        # Save to smart cache
-        try:
-            save_to_smart_cache(
-                file_id=final_file_id,
-                account_id=account["id"],
-                magnet_link=magnet_link,
-                file_name=file_info.get("name", file_name),
-                file_size=file_size
-            )
-        except Exception as e:
-            print(f"CACHE: Failed to save approved magnet: {e}")
         if response.status_code != 200:
             error_text = response.text
             print(f"APPROVE ERROR: n8n webhook returned status {response.status_code}: {error_text}", flush=True)
@@ -2796,14 +2756,11 @@ def admin_approve_magnet(magnet_id):
 
         # 3. Update DB status
         db.update_magnet_status(magnet_id, 'uploaded')
-        db.increment_quota(account["id"])
         
-        return jsonify({"success": True, "message": "Magnet approved and uploaded"})
         print(f"APPROVE: Successfully sent magnet {magnet_id} to n8n.", flush=True)
         return jsonify({"success": True, "message": "Magnet approved and sent to n8n"})
         
     except Exception as e:
-        print(f"APPROVE ERROR: {e}")
         print(f"APPROVE ERROR: {e}", flush=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
