@@ -8,7 +8,6 @@ import time
 import re
 import json
 import hashlib
-import time
 import random
 from datetime import datetime, timedelta
 from io import IOBase
@@ -2715,6 +2714,40 @@ def update_index():
 # ============================================================
 # SCRAPER APPROVAL ROUTES
 # ============================================================
+
+@app.route('/admin/api/add-scraped', methods=['POST'])
+def admin_add_scraped():
+    """Add a magnet from scraper to the queue"""
+    try:
+        data = request.json
+        magnet_link = data.get('magnet')
+        
+        if not magnet_link:
+            return jsonify({"success": False, "error": "No magnet link"}), 400
+            
+        # Check duplicates (Scraped DB + Smart Cache)
+        if db.check_magnet_exists(magnet_link):
+            return jsonify({"success": False, "message": "Duplicate skipped", "skipped": True})
+            
+        # Add to DB
+        success = db.add_scraped_magnet({
+            'magnet_link': magnet_link,
+            'movie_name': data.get('movie_name', 'Unknown'),
+            'year': data.get('year'),
+            'quality': data.get('quality', 'auto'),
+            'size': data.get('size'),
+            'source': data.get('source', 'scraper'),
+            'status': 'pending',
+            'created_at': datetime.now(timezone.utc).isoformat()
+        })
+        
+        if success:
+            return jsonify({"success": True, "message": "Added to queue"})
+        else:
+            return jsonify({"success": False, "error": "DB Insert failed"}), 500
+            
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/admin/api/scraped-magnets', methods=['GET'])
 def admin_get_scraped_magnets():

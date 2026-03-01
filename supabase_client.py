@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timezone
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -740,6 +741,48 @@ class SupabaseDB:
             return True
         except Exception as e:
             print(f"❌ DB Error (update_magnet_status): {e}")
+            return False
+
+    def check_magnet_exists(self, magnet_link: str) -> bool:
+        """
+        Check if magnet exists in EITHER scraped_magnets OR pikpak_files (smart cache).
+        Returns True if it exists (should be skipped).
+        """
+        try:
+            # 1. Check scraped_magnets (pending or uploaded)
+            response_scraped = self.client.table('scraped_magnets')\
+                .select('id', count='exact', head=True)\
+                .eq('magnet_link', magnet_link)\
+                .execute()
+            
+            if response_scraped.count and response_scraped.count > 0:
+                return True
+
+            # 2. Check Smart Cache (pikpak_files) using Hash
+            match = re.search(r'xt=urn:btih:([a-zA-Z0-9]+)', magnet_link, re.IGNORECASE)
+            if match:
+                magnet_hash = match.group(1).upper()
+                response_cache = self.client.table('pikpak_files')\
+                    .select('id', count='exact', head=True)\
+                    .eq('magnet_hash', magnet_hash)\
+                    .eq('is_trash', False)\
+                    .execute()
+                
+                if response_cache.count and response_cache.count > 0:
+                    return True
+            
+            return False
+        except Exception as e:
+            print(f"❌ DB Error (check_magnet_exists): {e}")
+            return False
+
+    def add_scraped_magnet(self, data: Dict) -> bool:
+        """Insert a new scraped magnet."""
+        try:
+            self.client.table('scraped_magnets').insert(data).execute()
+            return True
+        except Exception as e:
+            print(f"❌ DB Error (add_scraped_magnet): {e}")
             return False
 
 # Singleton instance
