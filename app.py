@@ -9,8 +9,7 @@ import re
 import json
 import hashlib
 import random
-from datetime import datetime, timedelta
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import IOBase
 from urllib.parse import unquote
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -2718,37 +2717,39 @@ def update_index():
 
 @app.route('/admin/api/add-scraped', methods=['POST'])
 def admin_add_scraped():
-    """Add a magnet from scraper to the queue"""
     try:
         data = request.json
-        magnet_link = data.get('magnet')
-        
+        magnet_link = data.get('magnet_link')
+
         if not magnet_link:
             return jsonify({"success": False, "error": "No magnet link"}), 400
-            
-        # Check duplicates (Scraped DB + Smart Cache)
-        if db.check_magnet_exists(magnet_link):
+
+        hash_match = re.search(r'urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})', magnet_link, re.IGNORECASE)
+        if not hash_match:
+            return jsonify({"success": False, "error": "Could not extract info_hash"}), 400
+        info_hash = hash_match.group(1).upper()
+
+        if db.check_magnet_exists(info_hash):
             return jsonify({"success": False, "message": "Duplicate skipped", "skipped": True})
-            
-        # Add to DB
+
         success = db.add_scraped_magnet({
+            'info_hash':   info_hash,
             'magnet_link': magnet_link,
-            'movie_name': data.get('movie_name', 'Unknown'),
-            'year': data.get('year'),
-            'quality': data.get('quality', 'auto'),
-            'size': data.get('size'),
-            'source': data.get('source', 'scraper'),
-            'status': 'pending',
-            'created_at': datetime.now(timezone.utc).isoformat()
+            'movie_name':  data.get('movie_name', 'Unknown'),
+            'quality':     data.get('quality', 'auto'),
+            'size':        data.get('size'),
+            'source':      data.get('source', 'scraper'),
+            'status':      'pending',
         })
-        
+
         if success:
             return jsonify({"success": True, "message": "Added to queue"})
         else:
             return jsonify({"success": False, "error": "DB Insert failed"}), 500
-            
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route('/admin/api/scraped-magnets', methods=['GET'])
 def admin_get_scraped_magnets():

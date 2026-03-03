@@ -743,7 +743,7 @@ class SupabaseDB:
             print(f"❌ DB Error (update_magnet_status): {e}")
             return False
 
-    def check_magnet_exists(self, magnet_link: str) -> bool:
+    def check_magnet_exists(self, info_hash: str) -> bool:
         """
         Check if magnet exists in EITHER scraped_magnets OR pikpak_files (smart cache).
         Returns True if it exists (should be skipped).
@@ -752,24 +752,21 @@ class SupabaseDB:
             # 1. Check scraped_magnets (pending or uploaded)
             response_scraped = self.client.table('scraped_magnets')\
                 .select('id', count='exact', head=True)\
-                .eq('magnet_link', magnet_link)\
+                .eq('info_hash', info_hash)\
                 .execute()
             
             if response_scraped.count and response_scraped.count > 0:
                 return True
 
             # 2. Check Smart Cache (pikpak_files) using Hash
-            match = re.search(r'xt=urn:btih:([a-zA-Z0-9]+)', magnet_link, re.IGNORECASE)
-            if match:
-                magnet_hash = match.group(1).upper()
-                response_cache = self.client.table('pikpak_files')\
-                    .select('id', count='exact', head=True)\
-                    .eq('magnet_hash', magnet_hash)\
-                    .eq('is_trash', False)\
-                    .execute()
-                
-                if response_cache.count and response_cache.count > 0:
-                    return True
+            response_cache = self.client.table('pikpak_files')\
+                .select('id', count='exact', head=True)\
+                .eq('magnet_hash', info_hash)\
+                .eq('is_trash', False)\
+                .execute()
+            
+            if response_cache.count and response_cache.count > 0:
+                return True
             
             return False
         except Exception as e:
